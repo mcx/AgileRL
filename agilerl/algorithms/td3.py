@@ -1,69 +1,206 @@
-import random
 import copy
+import inspect
+import warnings
+
 import dill
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from agilerl.networks.evolvable_mlp import EvolvableMLP
-from agilerl.networks.evolvable_cnn import EvolvableCNN
 
-class TD3():
+from agilerl.networks.evolvable_cnn import EvolvableCNN
+from agilerl.networks.evolvable_mlp import EvolvableMLP
+from agilerl.utils.algo_utils import chkpt_attribute_to_device, unwrap_optimizer
+from agilerl.wrappers.make_evolvable import MakeEvolvable
+
+
+class TD3:
     """The TD3 algorithm class. TD3 paper: https://arxiv.org/abs/1802.09477
 
     :param state_dim: State observation dimension
-    :type state_dim: int
+    :type state_dim: list[int]
     :param action_dim: Action dimension
     :type action_dim: int
     :param one_hot: One-hot encoding, used with discrete observation spaces
     :type one_hot: bool
-    :param max_action: Upper bound of the action space
-    :type max_action: float
-    :param expl_noise: Standard deviation for Gaussian exploration noise
-    :param expl_noise: float, optional
+    :param max_action: Upper bound of the action space, defaults to 1
+    :type max_action: float, optional
+    :param min_action: Lower bound of the action space, defaults to -1
+    :type min_action: float, optional
+    :param O_U_noise: Use Ornstein Uhlenbeck action noise for exploration. If False, uses Gaussian noise. Defaults to True
+    :type O_U_noise: bool, optional
+    :param vect_noise_dim: Vectorization dimension of environment for action noise, defaults to 1
+    :type vect_noise_dim: int, optional
+    :param expl_noise: Scale for Ornstein Uhlenbeck action noise, or standard deviation for Gaussian exploration noise
+    :type expl_noise: float, optional
+    :param mean_noise: Mean of exploration noise, defaults to 0.0
+    :type mean_noise: float, optional
+    :param theta: Rate of mean reversion in Ornstein Uhlenbeck action noise, defaults to 0.15
+    :type theta: float, optional
+    :param dt: Timestep for Ornstein Uhlenbeck action noise update, defaults to 1e-2
+    :type dt: float, optional
     :param index: Index to keep track of object instance during tournament selection and mutation, defaults to 0
     :type index: int, optional
     :param net_config: Network configuration, defaults to mlp with hidden size [64,64]
     :type net_config: dict, optional
     :param batch_size: Size of batched sample from replay buffer for learning, defaults to 64
     :type batch_size: int, optional
-    :param lr: Learning rate for optimizer, defaults to 1e-4
-    :type lr: float, optional
+    :param lr_actor: Learning rate for actor optimizer, defaults to 1e-4
+    :type lr_actor: float, optional
+    :param lr_critic: Learning rate for critic optimizer, defaults to 1e-3
+    :type lr_critic: float, optional
     :param learn_step: Learning frequency, defaults to 5
     :type learn_step: int, optional
     :param gamma: Discount factor, defaults to 0.99
     :type gamma: float, optional
     :param tau: For soft update of target network parameters, defaults to 1e-3
     :type tau: float, optional
-    :param mutation: Most recent mutation to agent, defaults to None
-    :type mutation: str, optional
-    :param policy_freq: Frequency of target network updates compared to policy network, defaults to 2
+    :param mut: Most recent mutation to agent, defaults to None
+    :type mut: str, optional
+    :param policy_freq: Frequency of critic network updates compared to policy network, defaults to 2
     :type policy_freq: int, optional
+    :param actor_network: Custom actor network, defaults to None
+    :type actor_network: nn.Module, optional
+    :param critic_networks: List of two custom critic networks (one for each of TD3's two critics), defaults to None
+    :type critic_networks: list[nn.Module], optional
     :param device: Device for accelerated computing, 'cpu' or 'cuda', defaults to 'cpu'
     :type device: str, optional
     :param accelerator: Accelerator for distributed computing, defaults to None
-    :type accelerator: Hugging Face accelerate.Accelerator(), optional
+    :type accelerator: accelerate.Accelerator(), optional
     :param wrap: Wrap models for distributed training upon creation, defaults to True
     :type wrap: bool, optional
     """
 
-    def __init__(self, state_dim, action_dim, one_hot, max_action, expl_noise=0.1, index=0, 
-                 net_config={'arch': 'mlp', 'h_size': [64,64]}, batch_size=64, lr=1e-4, learn_step=5, gamma=0.99, 
-                 tau=0.005, mutation=None, policy_freq=2, device='cpu', accelerator=None, wrap=True):
-        self.algo = 'TD3'
+    def __init__(
+        self,
+        state_dim,
+        action_dim,
+        one_hot,
+        max_action=1,
+        min_action=-1,
+        O_U_noise=True,
+        vect_noise_dim=1,
+        expl_noise=0.1,
+        mean_noise=0.0,
+        theta=0.15,
+        dt=1e-2,
+        index=0,
+        net_config={"arch": "mlp", "hidden_size": [64, 64]},
+        batch_size=64,
+        lr_actor=1e-4,
+        lr_critic=1e-3,
+        learn_step=5,
+        gamma=0.99,
+        tau=0.005,
+        mut=None,
+        policy_freq=2,
+        actor_network=None,
+        critic_networks=None,
+        device="cpu",
+        accelerator=None,
+        wrap=True,
+    ):
+        assert isinstance(
+            state_dim, (list, tuple)
+        ), "State dimension must be a list or tuple."
+        assert isinstance(
+            action_dim, (int, np.integer)
+        ), "Action dimension must be an integer."
+        assert isinstance(
+            one_hot, bool
+        ), "One-hot encoding flag must be boolean value True or False."
+        assert isinstance(
+            max_action,
+            (float, int, np.float32, np.float64, np.integer, list, np.ndarray),
+        ), "Max action must be a float or integer."
+        assert isinstance(
+            min_action,
+            (float, int, np.float32, np.float64, np.integer, list, np.ndarray),
+        ), "Min action must be a float or integer."
+        if isinstance(min_action, list):
+            assert (
+                len(min_action) == action_dim
+            ), "Length of min_action must be equal to action_dim."
+            min_action = np.array(min_action)
+        if isinstance(max_action, list):
+            assert (
+                len(max_action) == action_dim
+            ), "Length of max_action must be equal to action_dim."
+            max_action = np.array(max_action)
+        if isinstance(max_action, np.ndarray) or isinstance(min_action, np.ndarray):
+            assert np.all(
+                max_action > min_action
+            ), "Max action must be greater than min action."
+        else:
+            assert (
+                max_action > min_action
+            ), "Max action must be greater than min action."
+        assert (isinstance(expl_noise, (float, int))) or (
+            isinstance(expl_noise, np.ndarray)
+            and expl_noise.shape == (vect_noise_dim, action_dim)
+        ), "Exploration action noise rate must be a float, or an array of size action_dim"
+        if isinstance(expl_noise, (float, int)):
+            assert (
+                expl_noise >= 0
+            ), "Exploration noise must be greater than or equal to zero."
+        assert isinstance(index, int), "Agent index must be an integer."
+        assert isinstance(batch_size, int), "Batch size must be an integer."
+        assert batch_size >= 1, "Batch size must be greater than or equal to one."
+        assert isinstance(lr_actor, float), "Actor learning rate must be a float."
+        assert lr_actor > 0, "Actor learning rate must be greater than zero."
+        assert isinstance(lr_critic, float), "Critic learning rate must be a float."
+        assert lr_critic > 0, "Critic learning rate must be greater than zero."
+        assert isinstance(learn_step, int), "Learn step rate must be an integer."
+        assert learn_step >= 1, "Learn step must be greater than or equal to one."
+        assert isinstance(gamma, (float, int)), "Gamma must be a float."
+        assert isinstance(tau, float), "Tau must be a float."
+        assert tau > 0, "Tau must be greater than zero."
+        assert isinstance(policy_freq, int), "Policy frequency must be an integer."
+        assert (
+            policy_freq >= 1
+        ), "Policy frequency must be greater than or equal to one."
+        if (actor_network is not None) != (
+            critic_networks is not None
+        ):  # XOR operation
+            warnings.warn(
+                "Actor and critic networks must both be supplied to use custom networks. Defaulting to net config."
+            )
+        assert isinstance(
+            wrap, bool
+        ), "Wrap models flag must be boolean value True or False."
+
+        self.algo = "TD3"
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.one_hot = one_hot
+        self.max_action = max_action
+        self.min_action = min_action
         self.net_config = net_config
         self.batch_size = batch_size
-        self.lr = lr
+        self.lr_actor = lr_actor
+        self.lr_critic = lr_critic
         self.learn_step = learn_step
         self.gamma = gamma
         self.tau = tau
-        self.mut = mutation
+        self.mut = mut
         self.policy_freq = policy_freq
-        self.max_action = max_action
-        self.expl_noise = expl_noise
+        self.O_U_noise = O_U_noise
+        self.vect_noise_dim = vect_noise_dim
+        self.expl_noise = (
+            expl_noise
+            if isinstance(expl_noise, np.ndarray)
+            else expl_noise * np.ones((vect_noise_dim, action_dim))
+        )
+        self.mean_noise = (
+            mean_noise
+            if isinstance(mean_noise, np.ndarray)
+            else mean_noise * np.ones((vect_noise_dim, action_dim))
+        )
+        self.current_noise = np.zeros((vect_noise_dim, action_dim))
+        self.theta = theta
+        self.dt = dt
+        self.actor_network = actor_network
+        self.critic_networks = critic_networks
         self.device = device
         self.accelerator = accelerator
 
@@ -71,143 +208,154 @@ class TD3():
         self.scores = []
         self.fitness = []
         self.steps = [0]
+        self.learn_counter = 0
 
-        # model
-        # TD3 employs two critic networks
-        if self.net_config['arch'] == 'mlp':      # Multi-layer Perceptron
-            self.actor = EvolvableMLP(
-                num_inputs=state_dim[0],
-                num_outputs=action_dim,
-                hidden_size=self.net_config['h_size'],
-                output_activation='tanh',
-                device=self.device,
-                accelerator=self.accelerator)
-            self.actor_target = EvolvableMLP(
-                num_inputs=state_dim[0],
-                num_outputs=action_dim,
-                hidden_size=self.net_config['h_size'],
-                output_activation='tanh',
-                device=self.device,
-                accelerator=self.accelerator)
-            self.actor_target.load_state_dict(self.actor.state_dict())
+        if self.actor_network is not None and self.critic_networks is not None:
+            assert isinstance(
+                critic_networks, (list, tuple)
+            ), "Critic network must be a list or tuple"
+            assert len(critic_networks) == 2, "TD3 requires exactly 2 critic networks."
+            assert isinstance(critic_networks[0], type(actor_network)) and isinstance(
+                critic_networks[1], type(actor_network)
+            ), "'actor_network' and 'critic_networks' must be the same type."
+            self.actor = actor_network
+            self.critic_1, self.critic_2 = critic_networks
+            if (
+                isinstance(self.actor, (EvolvableMLP, EvolvableCNN))
+                and isinstance(self.critic_1, (EvolvableMLP, EvolvableCNN))
+                and isinstance(self.critic_1, (EvolvableMLP, EvolvableCNN))
+            ):
+                self.net_config = self.actor.net_config
+            elif (
+                isinstance(self.actor, MakeEvolvable)
+                and isinstance(self.critic_1, MakeEvolvable)
+                and isinstance(self.critic_1, MakeEvolvable)
+            ):
+                self.net_config = None
+            else:
+                assert (
+                    False
+                ), f"'actor_network' argument is of type {type(actor_network)} and critic networks are of type {type(critic_networks[0])}, \
+                                both must be the same type and be of type EvolvableMLP, EvolvableCNN or MakeEvolvable"
 
-            self.critic_1 = EvolvableMLP(
-                num_inputs=state_dim[0] + action_dim,
-                num_outputs=1,
-                hidden_size=self.net_config['h_size'],
-                device=self.device,
-                accelerator=self.accelerator)
-            self.critic_target_1 = EvolvableMLP(
-                num_inputs=state_dim[0] + action_dim,
-                num_outputs=1,
-                hidden_size=self.net_config['h_size'],
-                device=self.device,
-                accelerator=self.accelerator)
+        else:
+            # model
+            assert isinstance(self.net_config, dict), "Net config must be a dictionary."
+            assert (
+                "arch" in self.net_config.keys()
+            ), "Net config must contain arch: 'mlp' or 'cnn'."
 
-            self.critic_2 = EvolvableMLP(
-                num_inputs=state_dim[0] + action_dim,
-                num_outputs=1,
-                hidden_size=self.net_config['h_size'],
-                device=self.device,
-                accelerator=self.accelerator)
-            self.critic_target_2 = EvolvableMLP(
-                num_inputs=state_dim[0] + action_dim,
-                num_outputs=1,
-                hidden_size=self.net_config['h_size'],
-                device=self.device,
-                accelerator=self.accelerator)
+            if "mlp_output_activation" not in self.net_config.keys():
+                if np.any(self.min_action < 0):
+                    self.net_config["mlp_output_activation"] = "Tanh"
+                else:
+                    self.net_config["mlp_output_activation"] = "Sigmoid"
 
-            self.critic_target_1.load_state_dict(self.critic_1.state_dict())
-            self.critic_target_2.load_state_dict(self.critic_2.state_dict())
+            critic_net_config = copy.deepcopy(self.net_config)
+            critic_net_config["mlp_output_activation"] = (
+                None  # Critic must have no output activation
+            )
 
-        elif self.net_config['arch'] == 'cnn':    # Convolutional Neural Network
-            self.actor = EvolvableCNN(
-                input_shape=state_dim,
-                num_actions=action_dim,
-                channel_size=self.net_config['c_size'],
-                kernal_size=self.net_config['k_size'],
-                stride_size=self.net_config['s_size'],
-                hidden_size=self.net_config['h_size'],
-                normalize=self.net_config['normalize'],
-                mlp_activation='tanh',
-                device=self.device,
-                accelerator=self.accelerator)
-            self.actor_target = EvolvableCNN(
-                input_shape=state_dim,
-                num_actions=action_dim,
-                channel_size=self.net_config['c_size'],
-                kernal_size=self.net_config['k_size'],
-                stride_size=self.net_config['s_size'],
-                hidden_size=self.net_config['h_size'],
-                normalize=self.net_config['normalize'],
-                mlp_activation='tanh',
-                device=self.device,
-                accelerator=self.accelerator)
-            self.actor_target.load_state_dict(self.actor.state_dict())
+            if self.net_config["arch"] == "mlp":  # Multi-layer Perceptron
+                assert (
+                    "hidden_size" in self.net_config.keys()
+                ), "Net config must contain hidden_size: int."
+                assert isinstance(
+                    self.net_config["hidden_size"], list
+                ), "Net config hidden_size must be a list."
+                assert (
+                    len(self.net_config["hidden_size"]) > 0
+                ), "Net config hidden_size must contain at least one element."
+                # TD3 employs two critic networks
+                self.actor = EvolvableMLP(
+                    num_inputs=state_dim[0],
+                    num_outputs=action_dim,
+                    device=self.device,
+                    accelerator=self.accelerator,
+                    **self.net_config,
+                )
 
-            self.critic_1 = EvolvableCNN(
-                input_shape=state_dim,
-                num_actions=action_dim,
-                channel_size=self.net_config['c_size'],
-                kernal_size=self.net_config['k_size'],
-                stride_size=self.net_config['s_size'],
-                hidden_size=self.net_config['h_size'],
-                normalize=self.net_config['normalize'],
-                mlp_activation='tanh',
-                critic=True,
-                device=self.device,
-                accelerator=self.accelerator)
-            self.critic_target_1 = EvolvableCNN(
-                input_shape=state_dim,
-                num_actions=action_dim,
-                channel_size=self.net_config['c_size'],
-                kernal_size=self.net_config['k_size'],
-                stride_size=self.net_config['s_size'],
-                hidden_size=self.net_config['h_size'],
-                normalize=self.net_config['normalize'],
-                mlp_activation='tanh',
-                critic=True,
-                device=self.device,
-                accelerator=self.accelerator)
+                self.critic_1 = EvolvableMLP(
+                    num_inputs=state_dim[0] + action_dim,
+                    num_outputs=1,
+                    device=self.device,
+                    accelerator=self.accelerator,
+                    **critic_net_config,
+                )
+                self.critic_2 = EvolvableMLP(
+                    num_inputs=state_dim[0] + action_dim,
+                    num_outputs=1,
+                    device=self.device,
+                    accelerator=self.accelerator,
+                    **critic_net_config,
+                )
+            elif self.net_config["arch"] == "cnn":  # Convolutional Neural Network
+                for key in [
+                    "channel_size",
+                    "kernel_size",
+                    "stride_size",
+                    "hidden_size",
+                ]:
+                    assert (
+                        key in self.net_config.keys()
+                    ), f"Net config must contain {key}: int."
+                    assert isinstance(
+                        self.net_config[key], list
+                    ), f"Net config {key} must be a list."
+                    assert (
+                        len(self.net_config[key]) > 0
+                    ), f"Net config {key} must contain at least one element."
+                assert (
+                    "normalize" in self.net_config.keys()
+                ), "Net config must contain normalize: True or False."
+                assert isinstance(
+                    self.net_config["normalize"], bool
+                ), "Net config normalize must be boolean value True or False."
+                self.actor = EvolvableCNN(
+                    input_shape=state_dim,
+                    num_actions=action_dim,
+                    device=self.device,
+                    accelerator=self.accelerator,
+                    **self.net_config,
+                )
+                self.critic_1 = EvolvableCNN(
+                    input_shape=state_dim,
+                    num_actions=action_dim,
+                    critic=True,
+                    device=self.device,
+                    accelerator=self.accelerator,
+                    **critic_net_config,
+                )
+                self.critic_2 = EvolvableCNN(
+                    input_shape=state_dim,
+                    num_actions=action_dim,
+                    critic=True,
+                    device=self.device,
+                    accelerator=self.accelerator,
+                    **critic_net_config,
+                )
 
-            self.critic_2 = EvolvableCNN(
-                input_shape=state_dim,
-                num_actions=action_dim,
-                channel_size=self.net_config['c_size'],
-                kernal_size=self.net_config['k_size'],
-                stride_size=self.net_config['s_size'],
-                hidden_size=self.net_config['h_size'],
-                normalize=self.net_config['normalize'],
-                mlp_activation='tanh',
-                critic=True,
-                device=self.device,
-                accelerator=self.accelerator)
-            self.critic_target_2 = EvolvableCNN(
-                input_shape=state_dim,
-                num_actions=action_dim,
-                channel_size=self.net_config['c_size'],
-                kernal_size=self.net_config['k_size'],
-                stride_size=self.net_config['s_size'],
-                hidden_size=self.net_config['h_size'],
-                normalize=self.net_config['normalize'],
-                mlp_activation='tanh',
-                critic=True,
-                device=self.device,
-                accelerator=self.accelerator)
-        
-            self.critic_target_1.load_state_dict(self.critic_1.state_dict())
-            self.critic_target_2.load_state_dict(self.critic_2.state_dict())
+        self.actor_target = copy.deepcopy(self.actor)
+        self.critic_target_1 = copy.deepcopy(self.critic_1)
+        self.critic_target_2 = copy.deepcopy(self.critic_2)
+        self.actor_target.load_state_dict(self.actor.state_dict())
+        self.critic_target_1.load_state_dict(self.critic_1.state_dict())
+        self.critic_target_2.load_state_dict(self.critic_2.state_dict())
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.lr_actor)
+        self.critic_1_optimizer = optim.Adam(
+            self.critic_1.parameters(), lr=self.lr_critic
+        )
+        self.critic_2_optimizer = optim.Adam(
+            self.critic_2.parameters(), lr=self.lr_critic
+        )
 
-        self.actor_optimizer_type = optim.Adam(self.actor.parameters(), lr=self.lr)
-        self.critic_1_optimizer_type = optim.Adam(self.critic_1.parameters(), lr=self.lr)
-        self.critic_2_optimizer_type = optim.Adam(self.critic_2.parameters(), lr=self.lr)
-        
+        self.arch = (
+            self.net_config["arch"] if self.net_config is not None else self.actor.arch
+        )
+
         if self.accelerator is not None:
-            self.actor_optimizer = self.actor_optimizer_type
-            self.critic_1_optimizer = self.critic_1_optimizer_type
-            self.critic_2_optimizer = self.critic_2_optimizer_type
             if wrap:
-                self.wrap_models()          
+                self.wrap_models()
         else:
             self.actor = self.actor.to(self.device)
             self.actor_target = self.actor_target.to(self.device)
@@ -215,93 +363,216 @@ class TD3():
             self.critic_target_1 = self.critic_target_1.to(self.device)
             self.critic_2 = self.critic_2.to(self.device)
             self.critic_target_2 = self.critic_target_2.to(self.device)
-            self.actor_optimizer = self.actor_optimizer_type
-            self.critic_1_optimizer = self.critic_1_optimizer_type
-            self.critic_2_optimizer = self.critic_2_optimizer_type
-        
+
         self.criterion = nn.MSELoss()
 
-    def getAction(self, state, epsilon=0):
-        """Returns the next action to take in the environment, noise is added to aid exploration. 
+    def scale_to_action_space(self, action, convert_to_torch=False):
+        """Scales actions to action space defined by self.min_action and self.max_action.
+
+        :param action: Action to be scaled
+        :type action: numpy.ndarray
+        :param convert_to_torch: Flag to convert array to torch, defaults to False
+        :type convert_to_torch: bool, optional
+        """
+        if convert_to_torch:
+            max_action = (
+                torch.from_numpy(self.max_action).to(self.device)
+                if isinstance(self.max_action, (np.ndarray))
+                else self.max_action
+            )
+            min_action = (
+                torch.from_numpy(self.min_action).to(self.device)
+                if isinstance(self.min_action, (np.ndarray))
+                else self.min_action
+            )
+        else:
+            max_action = self.max_action
+            min_action = self.min_action
+
+        mlp_output_activation = self.actor.mlp_output_activation
+        if mlp_output_activation in ["Tanh"]:
+            pre_scaled_min = -1
+            pre_scaled_max = 1
+        elif mlp_output_activation in ["Sigmoid", "Softmax"]:
+            pre_scaled_min = 0
+            pre_scaled_max = 1
+        else:
+            return np.where(action > 0, action * max_action, action * -min_action)
+
+        if not (
+            isinstance(min_action, (np.ndarray, torch.Tensor))
+            or isinstance(max_action, (np.ndarray, torch.Tensor))
+        ):
+            if pre_scaled_min == min_action and pre_scaled_max == max_action:
+                return action
+
+        return min_action + (max_action - min_action) * (action - pre_scaled_min) / (
+            pre_scaled_max - pre_scaled_min
+        )
+
+    def multi_dim_clamp(self, min, max, input):
+        """Multi-dimensional clamp function"""
+        if not isinstance(min, np.ndarray) and not isinstance(max, np.ndarray):
+            return torch.clamp(input, min, max)
+
+        min = (
+            torch.from_numpy(min).to(self.device)
+            if isinstance(min, np.ndarray)
+            else min
+        )
+        max = (
+            torch.from_numpy(max).to(self.device)
+            if isinstance(max, np.ndarray)
+            else max
+        )
+
+        if isinstance(max, torch.Tensor) and isinstance(min, (int, float)):
+            min = torch.full_like(max, min).to(self.device)
+        if isinstance(min, torch.Tensor) and isinstance(max, (int, float)):
+            max = torch.full_like(min, max).to(self.device)
+
+        return torch.max(torch.min(input, max), min)
+
+    def get_action(self, state, training=True):
+        """Returns the next action to take in the environment.
         Epsilon is the probability of taking a random action, used for exploration.
         For epsilon-greedy behaviour, set epsilon to 0.
 
         :param state: Environment observation, or multiple observations in a batch
-        :type state: float or List[float]
-        :param epsilon: Probablilty of taking a random action for exploration, defaults to 0
-        :type epsilon: float, optional
+        :type state: numpy.ndarray[float]
+        :param training: Agent is training, use exploration noise, defaults to True
+        :type training: bool, optional
         """
-        state = torch.from_numpy(state).float().to(self.device)
+        state = torch.from_numpy(state).float()
+        if self.accelerator is None:
+            state = state.to(self.device)
+        else:
+            state = state.to(self.accelerator.device)
 
         if self.one_hot:
-            state = nn.functional.one_hot(
-                state.long(), num_classes=self.state_dim[0]).float().squeeze()
-
-        if len(state.size()) < 2:
-            state = state.unsqueeze(0)       
-
-        # epsilon-greedy, Gaussian noise added to aid exploration
-        if random.random() < epsilon:
-            action = (np.random.rand(
-                state.size()[0], self.action_dim).astype('float32') - 0.5) * 2
-        else:
-            self.actor.eval()
-            with torch.no_grad():
-                action_values = self.actor(state)
-            self.actor.train()
-
-            action = (
-                action_values.cpu().data.numpy()
-                + np.random.normal(0, self.max_action * self.expl_noise, size=self.action_dim
-            ).astype(np.float32).clip(-self.max_action, self.max_action)
+            state = (
+                nn.functional.one_hot(state.long(), num_classes=self.state_dim[0])
+                .float()
+                .squeeze()
             )
+
+        if (self.arch == "mlp" and len(state.size()) < 2) or (
+            self.arch == "cnn" and len(state.size()) < 4
+        ):
+            state = state.unsqueeze(0)
+
+        self.actor.eval()
+        with torch.no_grad():
+            action_values = self.actor(state)
+        self.actor.train()
+
+        action = self.scale_to_action_space(action_values.cpu().data.numpy())
+
+        if training:
+            action = (action + self.action_noise()).clip(
+                self.min_action, self.max_action
+            )
+
         return action
+
+    def action_noise(self):
+        """Create action noise for exploration, either Ornstein Uhlenbeck or
+            from a normal distribution.
+
+        :return: Action noise
+        :rtype: np.ndArray
+        """
+        if self.O_U_noise:
+            noise = (
+                self.current_noise
+                + self.theta * (self.mean_noise - self.current_noise) * self.dt
+                + self.expl_noise
+                * np.sqrt(self.dt)
+                * np.random.normal(size=(self.vect_noise_dim, self.action_dim))
+            )
+            self.current_noise = noise
+        else:
+            noise = np.random.normal(
+                self.mean_noise,
+                self.expl_noise,
+                size=(self.vect_noise_dim, self.action_dim),
+            )
+        return noise.astype(np.float32)
+
+    def reset_action_noise(self, indices):
+        """Reset action noise."""
+        self.current_noise[indices] = self.mean_noise[indices]
 
     def learn(self, experiences, noise_clip=0.5, policy_noise=0.2):
         """Updates agent network parameters to learn from experiences.
 
         :param experience: List of batched states, actions, rewards, next_states, dones in that order.
-        :type experience: List[torch.Tensor[float]]
+        :type experience: list[torch.Tensor[float]]
         :param noise_clip: Maximum noise limit to apply to actions, defaults to 0.5
         :type noise_clip: float, optional
         :param policy_noise: Standard deviation of noise applied to policy, defaults to 0.2
         :type policy_noise: float, optional
         """
         states, actions, rewards, next_states, dones = experiences
-        
+        if self.accelerator is not None:
+            states = states.to(self.accelerator.device)
+            actions = actions.to(self.accelerator.device)
+            rewards = rewards.to(self.accelerator.device)
+            next_states = next_states.to(self.accelerator.device)
+            dones = dones.to(self.accelerator.device)
+
         if self.one_hot:
-            states = nn.functional.one_hot(
-                states.long(), num_classes=self.state_dim[0]).float().squeeze()
-            next_states = nn.functional.one_hot(
-                next_states.long(), num_classes=self.state_dim[0]).float().squeeze()
-        
-        if self.net_config['arch'] == 'mlp':
+            states = (
+                nn.functional.one_hot(states.long(), num_classes=self.state_dim[0])
+                .float()
+                .squeeze()
+            )
+            next_states = (
+                nn.functional.one_hot(next_states.long(), num_classes=self.state_dim[0])
+                .float()
+                .squeeze()
+            )
+
+        if self.arch == "mlp":
             input_combined = torch.cat([states, actions], 1)
             q_value_1 = self.critic_1(input_combined)
             q_value_2 = self.critic_2(input_combined)
-        elif self.net_config['arch'] == 'cnn':
+        elif self.arch == "cnn":
             q_value_1 = self.critic_1(states, actions)
             q_value_2 = self.critic_2(states, actions)
 
-        next_actions = self.actor_target(next_states)
-        noise = actions.data.normal_(0, policy_noise).to(self.device)
-        noise = noise.clamp(-noise_clip, noise_clip)
-        next_actions = (next_actions + noise)
+        with torch.no_grad():
+            next_actions = self.actor_target(next_states)
+            # Scale actions
+            next_actions = self.scale_to_action_space(
+                next_actions, convert_to_torch=True
+            )
+            noise = actions.data.normal_(0, policy_noise)
+            if self.accelerator is not None:
+                noise = noise.to(self.accelerator.device)
+            else:
+                noise = noise.to(self.device)
+            noise = self.multi_dim_clamp(-noise_clip, noise_clip, noise)
+            next_actions = next_actions + noise
+            next_actions = self.multi_dim_clamp(
+                self.min_action, self.max_action, next_actions
+            )
 
-        # Compute the target, y_j, making use of twin critic networks
-        if self.net_config['arch'] == 'mlp':
-            next_input_combined = torch.cat([next_states, next_actions], 1)
-            q_value_next_state_1 = self.critic_target_1(next_input_combined)
-            q_value_next_state_2 = self.critic_target_2(next_input_combined)
-        elif self.net_config['arch'] == 'cnn':
-            q_value_next_state_1 = self.critic_target_1(next_states, next_actions)
-            q_value_next_state_2 = self.critic_target_2(next_states, next_actions)
-        q_value_next_state = torch.min(q_value_next_state_1, q_value_next_state_2)
-        y_j = rewards + ((1- dones)*self.gamma * q_value_next_state).detach()
+            # Compute the target, y_j, making use of twin critic networks
+            if self.arch == "mlp":
+                next_input_combined = torch.cat([next_states, next_actions], 1)
+                q_value_next_state_1 = self.critic_target_1(next_input_combined)
+                q_value_next_state_2 = self.critic_target_2(next_input_combined)
+            elif self.arch == "cnn":
+                q_value_next_state_1 = self.critic_target_1(next_states, next_actions)
+                q_value_next_state_2 = self.critic_target_2(next_states, next_actions)
+            q_value_next_state = torch.min(q_value_next_state_1, q_value_next_state_2)
+
+        y_j = rewards + ((1 - dones) * self.gamma * q_value_next_state)
 
         # Loss equation needs to be updated to account for two q_values from two critics
-        critic_loss = self.criterion(q_value_1, y_j) + self.criterion(q_value_2, y_j) 
-      
+        critic_loss = self.criterion(q_value_1, y_j) + self.criterion(q_value_2, y_j)
+
         # critic loss backprop
         self.critic_1_optimizer.zero_grad()
         self.critic_2_optimizer.zero_grad()
@@ -312,15 +583,19 @@ class TD3():
         self.critic_1_optimizer.step()
         self.critic_2_optimizer.step()
 
-        # update actor and targets every policy_freq episodes
-        if len(self.scores) % self.policy_freq == 0:
-            if self.net_config['arch'] == 'mlp':
-                input_combined = torch.cat(
-                    [states, self.actor.forward(states)], 1)
+        # update actor and targets every policy_freq learn steps
+        self.learn_counter += 1
+        if self.learn_counter % self.policy_freq == 0:
+            policy_actions = self.actor.forward(states)
+            policy_actions = self.scale_to_action_space(
+                policy_actions, convert_to_torch=True
+            )
+
+            if self.arch == "mlp":
+                input_combined = torch.cat([states, policy_actions], 1)
                 actor_loss = -self.critic_1(input_combined).mean()
-            elif self.net_config['arch'] == 'cnn':
-                actor_loss = - \
-                    self.critic_1(states, self.actor.forward(states)).mean()
+            elif self.arch == "cnn":
+                actor_loss = -self.critic_1(states, policy_actions).mean()
 
             # actor loss backprop
             self.actor_optimizer.zero_grad()
@@ -331,41 +606,56 @@ class TD3():
             self.actor_optimizer.step()
 
             # Add in a soft update for both critic_targets
-            self.softUpdate(self.actor, self.actor_target)
-            self.softUpdate(self.critic_1, self.critic_target_1)
-            self.softUpdate(self.critic_2, self.critic_target_2)
+            self.soft_update(self.actor, self.actor_target)
+            self.soft_update(self.critic_1, self.critic_target_1)
+            self.soft_update(self.critic_2, self.critic_target_2)
 
-    def softUpdate(self, net, target):
-        """Soft updates target network.
-        """
+            return actor_loss.item(), critic_loss.item()
+        else:
+            return None, critic_loss.item()
+
+    def soft_update(self, net, target):
+        """Soft updates target network."""
         for eval_param, target_param in zip(net.parameters(), target.parameters()):
             target_param.data.copy_(
-                self.tau * eval_param.data + (1.0 - self.tau) * target_param.data)
+                self.tau * eval_param.data + (1.0 - self.tau) * target_param.data
+            )
 
-    def test(self, env, swap_channels=False, max_steps=500, loop=3):
+    def test(self, env, swap_channels=False, max_steps=None, loop=3):
         """Returns mean test score of agent in environment with epsilon-greedy policy.
 
         :param env: The environment to be tested in
         :type env: Gym-style environment
         :param swap_channels: Swap image channels dimension from last to first [H, W, C] -> [C, H, W], defaults to False
         :type swap_channels: bool, optional
-        :param max_steps: Maximum number of testing steps, defaults to 500
+        :param max_steps: Maximum number of testing steps, defaults to None
         :type max_steps: int, optional
-        :param loop: Number of testing loops/epsiodes to complete. The returned score is the mean. Defaults to 3
+        :param loop: Number of testing loops/episodes to complete. The returned score is the mean. Defaults to 3
         :type loop: int, optional
         """
         with torch.no_grad():
             rewards = []
+            num_envs = env.num_envs if hasattr(env, "num_envs") else 1
             for i in range(loop):
-                state = env.reset()[0]
-                score = 0
-                for idx_step in range(max_steps):
+                state, _ = env.reset()
+                scores = np.zeros(num_envs)
+                completed_episode_scores = np.zeros(num_envs)
+                finished = np.zeros(num_envs)
+                step = 0
+                while not np.all(finished):
                     if swap_channels:
-                        state = np.moveaxis(state, [3], [1])
-                    action = self.getAction(state, epsilon=0)
-                    state, reward, done, _, _ = env.step(action)
-                    score += reward
-                rewards.append(score)
+                        state = np.moveaxis(state, [-1], [-3])
+                    action = self.get_action(state, training=False)
+                    state, reward, done, trunc, _ = env.step(action)
+                    step += 1
+                    scores += np.array(reward)
+                    for idx, (d, t) in enumerate(zip(done, trunc)):
+                        if (
+                            d or t or (max_steps is not None and step == max_steps)
+                        ) and not finished[idx]:
+                            completed_episode_scores[idx] = scores[idx]
+                            finished[idx] = 1
+                rewards.append(np.mean(completed_episode_scores))
         mean_fit = np.mean(rewards)
         self.fitness.append(mean_fit)
         return mean_fit
@@ -376,26 +666,9 @@ class TD3():
         :param index: Index to keep track of agent for tournament selection and mutation, defaults to None
         :type index: int, optional
         """
-        if index is None:
-            index = self.index
-
-        clone = type(self)(state_dim=self.state_dim,
-                           action_dim=self.action_dim,
-                           one_hot=self.one_hot,
-                           max_action=self.max_action,
-                           expl_noise=self.expl_noise,
-                           index=index,
-                           net_config=self.net_config,
-                           batch_size=self.batch_size,
-                           lr=self.lr,
-                           learn_step=self.learn_step,
-                           gamma=self.gamma,
-                           tau=self.tau,
-                           mutation=self.mut,
-                           policy_freq=self.policy_freq,
-                           device=self.device,
-                           accelerator=self.accelerator,
-                           wrap=wrap)
+        input_args = self.inspect_attributes(input_args_only=True)
+        input_args["wrap"] = wrap
+        clone = type(self)(**input_args)
 
         if self.accelerator is not None:
             self.unwrap_models()
@@ -406,32 +679,59 @@ class TD3():
         critic_2 = self.critic_2.clone()
         critic_target_2 = self.critic_target_2.clone()
 
-        actor_optimizer = optim.Adam(clone.actor.parameters(), lr=clone.lr)
-        critic_1_optimizer = optim.Adam(clone.critic_1.parameters(), lr=clone.lr)
-        critic_2_optimizer = optim.Adam(clone.critic_2.parameters(), lr=clone.lr)
+        actor_optimizer = optim.Adam(actor.parameters(), lr=clone.lr_actor)
+        critic_1_optimizer = optim.Adam(critic_1.parameters(), lr=clone.lr_critic)
+        critic_2_optimizer = optim.Adam(critic_2.parameters(), lr=clone.lr_critic)
 
-        clone.actor_optimizer_type = actor_optimizer
-        clone.critic_1_optimizer_type = critic_1_optimizer
-        clone.critic_2_optimizer_type = critic_2_optimizer
+        actor_optimizer.load_state_dict(self.actor_optimizer.state_dict())
+        critic_1_optimizer.load_state_dict(self.critic_1_optimizer.state_dict())
+        critic_2_optimizer.load_state_dict(self.critic_2_optimizer.state_dict())
 
         if self.accelerator is not None:
             if wrap:
-                clone.actor, clone.actor_target, clone.critic_1, clone.critic_target_1, \
-                clone.critic_2, clone.critic_target_2, clone.actor_optimizer, \
-                clone.critic_1_optimizer, clone.critic_2_optimizer = self.accelerator.prepare(actor,
-                                                                                            actor_target,
-                                                                                            critic_1,
-                                                                                            critic_target_1,
-                                                                                            critic_2,
-                                                                                            critic_target_2,
-                                                                                            actor_optimizer,
-                                                                                            critic_1_optimizer,
-                                                                                            critic_2_optimizer)
+                (
+                    clone.actor,
+                    clone.actor_target,
+                    clone.critic_1,
+                    clone.critic_target_1,
+                    clone.critic_2,
+                    clone.critic_target_2,
+                    clone.actor_optimizer,
+                    clone.critic_1_optimizer,
+                    clone.critic_2_optimizer,
+                ) = self.accelerator.prepare(
+                    actor,
+                    actor_target,
+                    critic_1,
+                    critic_target_1,
+                    critic_2,
+                    critic_target_2,
+                    actor_optimizer,
+                    critic_1_optimizer,
+                    critic_2_optimizer,
+                )
             else:
-                clone.actor, clone.actor_target, clone.critic_1, clone.critic_target_1, clone.critic_2, \
-                clone.critic_target_2, clone.actor_optimizer, clone.critic_1_optimizer, \
-                clone.critic_1_optimizer = actor, actor_target, critic_1, critic_target_1, critic_2, \
-                critic_target_2, actor_optimizer, critic_1_optimizer, critic_2_optimizer
+                (
+                    clone.actor,
+                    clone.actor_target,
+                    clone.critic_1,
+                    clone.critic_target_1,
+                    clone.critic_2,
+                    clone.critic_target_2,
+                    clone.actor_optimizer,
+                    clone.critic_1_optimizer,
+                    clone.critic_1_optimizer,
+                ) = (
+                    actor,
+                    actor_target,
+                    critic_1,
+                    critic_target_1,
+                    critic_2,
+                    critic_target_2,
+                    actor_optimizer,
+                    critic_1_optimizer,
+                    critic_2_optimizer,
+                )
         else:
             clone.actor = actor.to(self.device)
             clone.actor_target = actor_target.to(self.device)
@@ -443,26 +743,91 @@ class TD3():
             clone.critic_1_optimizer = critic_1_optimizer
             clone.critic_2_optimizer = critic_2_optimizer
 
-        clone.fitness = copy.deepcopy(self.fitness)
-        clone.steps = copy.deepcopy(self.steps)
-        clone.scores = copy.deepcopy(self.scores)
+        for attribute in self.inspect_attributes().keys():
+            if hasattr(self, attribute) and hasattr(clone, attribute):
+                attr, clone_attr = getattr(self, attribute), getattr(clone, attribute)
+                if isinstance(attr, torch.Tensor) or isinstance(
+                    clone_attr, torch.Tensor
+                ):
+                    if not torch.equal(attr, clone_attr):
+                        setattr(
+                            clone, attribute, copy.deepcopy(getattr(self, attribute))
+                        )
+                elif isinstance(attr, np.ndarray) or isinstance(clone_attr, np.ndarray):
+                    if not np.array_equal(attr, clone_attr):
+                        setattr(
+                            clone, attribute, copy.deepcopy(getattr(self, attribute))
+                        )
+                else:
+                    if attr != clone_attr:
+                        setattr(
+                            clone, attribute, copy.deepcopy(getattr(self, attribute))
+                        )
+            else:
+                setattr(clone, attribute, copy.deepcopy(getattr(self, attribute)))
+
+        if index is not None:
+            clone.index = index
 
         return clone
-    
+
+    def inspect_attributes(self, input_args_only=False):
+        # Get all attributes of the current object
+        attributes = inspect.getmembers(self, lambda a: not (inspect.isroutine(a)))
+        guarded_attributes = [
+            "actor",
+            "critic_1",
+            "critic_2",
+            "actor_target",
+            "critic_target_1",
+            "critic_target_2",
+            "actor_optimizer",
+            "critic_1_optimizer",
+            "critic_2_optimizer",
+        ]
+
+        # Exclude private and built-in attributes
+        attributes = [
+            a for a in attributes if not (a[0].startswith("__") and a[0].endswith("__"))
+        ]
+
+        if input_args_only:
+            constructor_params = inspect.signature(self.__init__).parameters.keys()
+            attributes = {
+                k: v
+                for k, v in attributes
+                if k not in guarded_attributes and k in constructor_params
+            }
+        else:
+            # Remove the algo specific guarded variables
+            attributes = {k: v for k, v in attributes if k not in guarded_attributes}
+
+        return attributes
+
     def wrap_models(self):
         if self.accelerator is not None:
-            self.actor, self.actor_target, self.critic_1, self.critic_target_1, \
-            self.critic_2, self.critic_target_2, self.actor_optimizer, \
-            self.critic_1_optimizer, self.critic_2_optimizer = self.accelerator.prepare(self.actor,
-                                                                                        self.actor_target,
-                                                                                        self.critic_1,
-                                                                                        self.critic_target_1,
-                                                                                        self.critic_2,
-                                                                                        self.critic_target_2,
-                                                                                        self.actor_optimizer_type,
-                                                                                        self.critic_1_optimizer_type,
-                                                                                        self.critic_2_optimizer_type)
-    
+            (
+                self.actor,
+                self.actor_target,
+                self.critic_1,
+                self.critic_target_1,
+                self.critic_2,
+                self.critic_target_2,
+                self.actor_optimizer,
+                self.critic_1_optimizer,
+                self.critic_2_optimizer,
+            ) = self.accelerator.prepare(
+                self.actor,
+                self.actor_target,
+                self.critic_1,
+                self.critic_target_1,
+                self.critic_2,
+                self.critic_target_2,
+                self.actor_optimizer,
+                self.critic_1_optimizer,
+                self.critic_2_optimizer,
+            )
+
     def unwrap_models(self):
         if self.accelerator is not None:
             self.actor = self.accelerator.unwrap_model(self.actor)
@@ -471,90 +836,246 @@ class TD3():
             self.critic_target_1 = self.accelerator.unwrap_model(self.critic_target_1)
             self.critic_2 = self.accelerator.unwrap_model(self.critic_2)
             self.critic_target_2 = self.accelerator.unwrap_model(self.critic_target_2)
-            self.actor_optimizer = self.accelerator.unwrap_model(self.actor_optimizer)
-            self.critic_1_optimizer = self.accelerator.unwrap_model(self.critic_1_optimizer)
-            self.critic_2_optimizer = self.accelerator.unwrap_model(self.critic_2_optimizer)
+            self.actor_optimizer = unwrap_optimizer(
+                self.actor_optimizer, self.actor, self.lr_actor
+            )
+            self.critic_1_optimizer = unwrap_optimizer(
+                self.critic_1_optimizer, self.critic_1, self.lr_critic
+            )
+            self.critic_2_optimizer = unwrap_optimizer(
+                self.critic_2_optimizer, self.critic_2, self.lr_critic
+            )
 
-    def saveCheckpoint(self, path):
+    def save_checkpoint(self, path):
         """Saves a checkpoint of agent properties and network weights to path.
 
         :param path: Location to save checkpoint at
         :type path: string
         """
-        torch.save({
-            'actor_init_dict': self.actor.init_dict,
-            'actor_state_dict': self.actor.state_dict(),
-            'actor_target_init_dict': self.actor_target.init_dict,
-            'actor_target_state_dict': self.actor_target.state_dict(),
-            'critic_1_init_dict': self.critic_1.init_dict,
-            'critic_1_state_dict': self.critic_1.state_dict(),
-            'critic_target_1_init_dict': self.critic_target_1.init_dict,
-            'critic_target_1_state_dict': self.critic_target_1.state_dict(),
-            'critic_2_init_dict': self.critic_2.init_dict,
-            'critic_2_state_dict': self.critic_2.state_dict(),
-            'critic_target_2_init_dict': self.critic_target_2.init_dict,
-            'critic_target_2_state_dict': self.critic_target_2.state_dict(),
-            'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
-            'critic_1_optimizer_state_dict': self.critic_1_optimizer.state_dict(),
-            'critic_2_optimizer_state_dict': self.critic_2_optimizer.state_dict(),
-            'net_config': self.net_config,
-            'batch_size': self.batch_size,
-            'lr': self.lr,
-            'learn_step': self.learn_step,
-            'gamma': self.gamma,
-            'tau': self.tau,
-            'mutation': self.mut,
-            'max_action':self.max_action,
-            'expl_noise':self.expl_noise,
-            'index': self.index,
-            'scores': self.scores,
-            'fitness': self.fitness,
-            'steps': self.steps,
-        }, path, pickle_module=dill)
+        attribute_dict = self.inspect_attributes()
 
-    def loadCheckpoint(self, path):
+        network_info = {
+            "actor_init_dict": self.actor.init_dict,
+            "actor_state_dict": self.actor.state_dict(),
+            "actor_target_init_dict": self.actor_target.init_dict,
+            "actor_target_state_dict": self.actor_target.state_dict(),
+            "critic_1_init_dict": self.critic_1.init_dict,
+            "critic_1_state_dict": self.critic_1.state_dict(),
+            "critic_target_1_init_dict": self.critic_target_1.init_dict,
+            "critic_target_1_state_dict": self.critic_target_1.state_dict(),
+            "critic_2_init_dict": self.critic_2.init_dict,
+            "critic_2_state_dict": self.critic_2.state_dict(),
+            "critic_target_2_init_dict": self.critic_target_2.init_dict,
+            "critic_target_2_state_dict": self.critic_target_2.state_dict(),
+            "actor_optimizer_state_dict": self.actor_optimizer.state_dict(),
+            "critic_1_optimizer_state_dict": self.critic_1_optimizer.state_dict(),
+            "critic_2_optimizer_state_dict": self.critic_2_optimizer.state_dict(),
+        }
+
+        attribute_dict.update(network_info)
+
+        torch.save(
+            attribute_dict,
+            path,
+            pickle_module=dill,
+        )
+
+    def load_checkpoint(self, path):
         """Loads saved agent properties and network weights from checkpoint.
 
         :param path: Location to load checkpoint from
         :type path: string
         """
-        checkpoint = torch.load(path, pickle_module=dill)
-        self.net_config = checkpoint['net_config']
-        if self.net_config['arch'] == 'mlp':
-            self.actor = EvolvableMLP(**checkpoint['actor_init_dict'])
-            self.actor_target = EvolvableMLP(**checkpoint['actor_target_init_dict'])
-            self.critic_1 = EvolvableMLP(**checkpoint['critic_1_init_dict'])
-            self.critic_target_1 = EvolvableMLP(**checkpoint['critic_target_1_init_dict'])
-            self.critic_2 = EvolvableMLP(**checkpoint['critic_2_init_dict'])
-            self.critic_target_2 = EvolvableMLP(**checkpoint['critic_target_2_init_dict'])
-        elif self.net_config['arch'] == 'cnn':
-            self.actor = EvolvableCNN(**checkpoint['actor_init_dict'])
-            self.actor_target = EvolvableCNN(**checkpoint['actor_target_init_dict'])
-            self.critic_1 = EvolvableCNN(**checkpoint['critic_1_init_dict'])
-            self.critic_target_1 = EvolvableCNN(**checkpoint['critic_target_1_init_dict'])
-            self.critic_2 = EvolvableCNN(**checkpoint['critic_2_init_dict'])
-            self.critic_target_2 = EvolvableCNN(**checkpoint['critic_target_2_init_dict'])
-        self.lr = checkpoint['lr']
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.lr)
-        self.critic_1_optimizer = optim.Adam(self.critic_1.parameters(), lr=self.lr)
-        self.critic_2_optimizer = optim.Adam(self.critic_2.parameters(), lr=self.lr)
-        self.actor.load_state_dict(checkpoint['actor_state_dict'])
-        self.actor_target.load_state_dict(checkpoint['actor_target_state_dict'])
-        self.critic_1.load_state_dict(checkpoint['critic_1_state_dict'])
-        self.critic_target_1.load_state_dict(checkpoint['critic_target_1_state_dict'])
-        self.critic_2.load_state_dict(checkpoint['critic_2_state_dict'])
-        self.critic_target_2.load_state_dict(checkpoint['critic_target_2_state_dict'])
-        self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
-        self.critic_1_optimizer.load_state_dict(checkpoint['critic_1_optimizer_state_dict'])
-        self.critic_2_optimizer.load_state_dict(checkpoint['critic_2_optimizer_state_dict'])
-        self.batch_size = checkpoint['batch_size']
-        self.learn_step = checkpoint['learn_step']
-        self.gamma = checkpoint['gamma']
-        self.tau = checkpoint['tau']
-        self.mut = checkpoint['mutation']
-        self.max_action = checkpoint['max_action']
-        self.expl_noise = checkpoint['expl_noise']
-        self.index = checkpoint['index']
-        self.scores = checkpoint['scores']
-        self.fitness = checkpoint['fitness']
-        self.steps = checkpoint['steps']
+        network_info = [
+            "actor_state_dict",
+            "actor_target_state_dict",
+            "actor_optimizer_state_dict",
+            "actor_init_dict",
+            "actor_target_init_dict",
+            "critic_1_state_dict",
+            "critic_target_1_state_dict",
+            "critic_1_optimizer_state_dict",
+            "critic_1_init_dict",
+            "critic_target_1_init_dict",
+            "critic_2_state_dict",
+            "critic_target_2_state_dict",
+            "critic_2_optimizer_state_dict",
+            "critic_2_init_dict",
+            "critic_target_2_init_dict",
+            "net_config",
+            "lr_actor",
+            "lr_critic",
+        ]
+
+        checkpoint = torch.load(path, map_location=self.device, pickle_module=dill)
+        self.net_config = checkpoint["net_config"]
+        if self.net_config is not None:
+            self.arch = checkpoint["net_config"]["arch"]
+            if self.arch == "mlp":
+                network_class = EvolvableMLP
+            elif self.arch == "cnn":
+                network_class = EvolvableCNN
+        else:
+            network_class = MakeEvolvable
+
+        self.actor = network_class(**checkpoint["actor_init_dict"])
+        self.actor_target = network_class(**checkpoint["actor_target_init_dict"])
+        self.critic_1 = network_class(**checkpoint["critic_1_init_dict"])
+        self.critic_target_1 = network_class(**checkpoint["critic_target_1_init_dict"])
+        self.critic_2 = network_class(**checkpoint["critic_2_init_dict"])
+        self.critic_target_2 = network_class(**checkpoint["critic_target_2_init_dict"])
+
+        self.lr_actor = checkpoint["lr_actor"]
+        self.lr_critic = checkpoint["lr_critic"]
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.lr_actor)
+        self.critic_1_optimizer = optim.Adam(
+            self.critic_1.parameters(), lr=self.lr_critic
+        )
+        self.critic_2_optimizer = optim.Adam(
+            self.critic_2.parameters(), lr=self.lr_critic
+        )
+        self.actor.load_state_dict(checkpoint["actor_state_dict"])
+        self.actor_target.load_state_dict(checkpoint["actor_target_state_dict"])
+        self.critic_1.load_state_dict(checkpoint["critic_1_state_dict"])
+        self.critic_target_1.load_state_dict(checkpoint["critic_target_1_state_dict"])
+        self.critic_2.load_state_dict(checkpoint["critic_2_state_dict"])
+        self.critic_target_2.load_state_dict(checkpoint["critic_target_2_state_dict"])
+        self.actor_optimizer.load_state_dict(checkpoint["actor_optimizer_state_dict"])
+        self.critic_1_optimizer.load_state_dict(
+            checkpoint["critic_1_optimizer_state_dict"]
+        )
+        self.critic_2_optimizer.load_state_dict(
+            checkpoint["critic_2_optimizer_state_dict"]
+        )
+        for attribute in checkpoint.keys():
+            if attribute not in network_info:
+                setattr(self, attribute, checkpoint[attribute])
+
+    @classmethod
+    def load(cls, path, device="cpu", accelerator=None):
+        """Creates agent with properties and network weights loaded from path.
+
+        :param path: Location to load checkpoint from
+        :type path: string
+        :param device: Device for accelerated computing, 'cpu' or 'cuda', defaults to 'cpu'
+        :type device: str, optional
+        :param accelerator: Accelerator for distributed computing, defaults to None
+        :type accelerator: accelerate.Accelerator(), optional
+        """
+        checkpoint = torch.load(path, map_location=device, pickle_module=dill)
+        checkpoint["actor_init_dict"]["device"] = device
+        checkpoint["actor_target_init_dict"]["device"] = device
+        checkpoint["critic_1_init_dict"]["device"] = device
+        checkpoint["critic_target_1_init_dict"]["device"] = device
+        checkpoint["critic_2_init_dict"]["device"] = device
+        checkpoint["critic_target_2_init_dict"]["device"] = device
+
+        actor_init_dict = chkpt_attribute_to_device(
+            checkpoint.pop("actor_init_dict"), device
+        )
+        actor_target_init_dict = chkpt_attribute_to_device(
+            checkpoint.pop("actor_target_init_dict"), device
+        )
+        actor_state_dict = chkpt_attribute_to_device(
+            checkpoint.pop("actor_state_dict"), device
+        )
+        actor_target_state_dict = chkpt_attribute_to_device(
+            checkpoint.pop("actor_target_state_dict"), device
+        )
+        actor_optimizer_state_dict = chkpt_attribute_to_device(
+            checkpoint.pop("actor_optimizer_state_dict"), device
+        )
+        critic_1_init_dict = chkpt_attribute_to_device(
+            checkpoint.pop("critic_1_init_dict"), device
+        )
+        critic_target_1_init_dict = chkpt_attribute_to_device(
+            checkpoint.pop("critic_target_1_init_dict"), device
+        )
+        critic_1_state_dict = chkpt_attribute_to_device(
+            checkpoint.pop("critic_1_state_dict"), device
+        )
+        critic_target_1_state_dict = chkpt_attribute_to_device(
+            checkpoint.pop("critic_target_1_state_dict"), device
+        )
+        critic_1_optimizer_state_dict = chkpt_attribute_to_device(
+            checkpoint.pop("critic_1_optimizer_state_dict"), device
+        )
+        critic_2_init_dict = chkpt_attribute_to_device(
+            checkpoint.pop("critic_2_init_dict"), device
+        )
+        critic_target_2_init_dict = chkpt_attribute_to_device(
+            checkpoint.pop("critic_target_2_init_dict"), device
+        )
+        critic_2_state_dict = chkpt_attribute_to_device(
+            checkpoint.pop("critic_2_state_dict"), device
+        )
+        critic_target_2_state_dict = chkpt_attribute_to_device(
+            checkpoint.pop("critic_target_2_state_dict"), device
+        )
+        critic_2_optimizer_state_dict = chkpt_attribute_to_device(
+            checkpoint.pop("critic_2_optimizer_state_dict"), device
+        )
+
+        checkpoint["device"] = device
+        checkpoint["accelerator"] = accelerator
+        checkpoint = chkpt_attribute_to_device(checkpoint, device)
+
+        constructor_params = inspect.signature(cls.__init__).parameters.keys()
+        class_init_dict = {
+            k: v for k, v in checkpoint.items() if k in constructor_params
+        }
+
+        if checkpoint["net_config"] is not None:
+            agent = cls(**class_init_dict)
+            agent.arch = checkpoint["net_config"]["arch"]
+            if agent.arch == "mlp":
+                agent.actor = EvolvableMLP(**actor_init_dict)
+                agent.actor_target = EvolvableMLP(**actor_target_init_dict)
+                agent.critic_1 = EvolvableMLP(**critic_1_init_dict)
+                agent.critic_target_1 = EvolvableMLP(**critic_target_1_init_dict)
+                agent.critic_2 = EvolvableMLP(**critic_2_init_dict)
+                agent.critic_target_2 = EvolvableMLP(**critic_target_2_init_dict)
+            elif agent.arch == "cnn":
+                agent.actor = EvolvableCNN(**actor_init_dict)
+                agent.actor_target = EvolvableCNN(**actor_target_init_dict)
+                agent.critic_1 = EvolvableCNN(**critic_1_init_dict)
+                agent.critic_target_1 = EvolvableCNN(**critic_target_1_init_dict)
+                agent.critic_2 = EvolvableCNN(**critic_2_init_dict)
+                agent.critic_target_2 = EvolvableCNN(**critic_target_2_init_dict)
+        else:
+            class_init_dict["actor_network"] = MakeEvolvable(**actor_init_dict)
+            class_init_dict["critic_networks"] = [
+                MakeEvolvable(**critic_1_init_dict),
+                MakeEvolvable(**critic_2_init_dict),
+            ]
+            agent = cls(**class_init_dict)
+            agent.actor_target = MakeEvolvable(**actor_target_init_dict)
+            agent.critic_target_1 = MakeEvolvable(**critic_target_1_init_dict)
+            agent.critic_target_2 = MakeEvolvable(**critic_target_2_init_dict)
+
+        agent.actor_optimizer = optim.Adam(agent.actor.parameters(), lr=agent.lr_actor)
+        agent.actor.load_state_dict(actor_state_dict)
+        agent.actor_target.load_state_dict(actor_target_state_dict)
+        agent.actor_optimizer.load_state_dict(actor_optimizer_state_dict)
+
+        agent.critic_1_optimizer = optim.Adam(
+            agent.critic_1.parameters(), lr=agent.lr_critic
+        )
+        agent.critic_1.load_state_dict(critic_1_state_dict)
+        agent.critic_target_1.load_state_dict(critic_target_1_state_dict)
+        agent.critic_1_optimizer.load_state_dict(critic_1_optimizer_state_dict)
+
+        agent.critic_2_optimizer = optim.Adam(
+            agent.critic_2.parameters(), lr=agent.lr_critic
+        )
+        agent.critic_2.load_state_dict(critic_2_state_dict)
+        agent.critic_target_2.load_state_dict(critic_target_2_state_dict)
+        agent.critic_2_optimizer.load_state_dict(critic_2_optimizer_state_dict)
+
+        if accelerator is not None:
+            agent.wrap_models()
+
+        for attribute in agent.inspect_attributes().keys():
+            setattr(agent, attribute, checkpoint[attribute])
+
+        return agent

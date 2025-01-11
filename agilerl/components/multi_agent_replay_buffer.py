@@ -1,80 +1,150 @@
-import torch
-import numpy as np
-from collections import deque, namedtuple
 import random
+from collections import deque, namedtuple
+
+import numpy as np
+import torch
 
 
 class MultiAgentReplayBuffer:
-    '''The Multi-Agent Experience Replay Buffer class. Used to store multiple agents'
+    """The Multi-Agent Experience Replay Buffer class. Used to store multiple agents'
     experiences and allow off-policy learning.
 
     :param memory_size: Maximum length of the replay buffer
     :type memory_size: int
     :param field_names: Field names for experience named tuple, e.g. ['state', 'action', 'reward']
-    :type field_names: List[str]
+    :type field_names: list[str]
     :param agent_ids: Names of all agents that will act in the environment
-    :type agent_ids: List[str]
+    :type agent_ids: list[str]
     :param device: Device for accelerated computing, 'cpu' or 'cuda', defaults to None
     :type device: str, optional
 
-    '''
+    """
+
     def __init__(self, memory_size, field_names, agent_ids, device=None):
-        self.memory = memory_size
+        assert memory_size > 0, "Mmeory size must be greater than zero."
+        assert len(field_names) > 0, "Field names must contain at least one field name."
+        assert len(agent_ids) > 0, "Agent ids must contain at least one agent id."
+
+        self.memory_size = memory_size
         self.memory = deque(maxlen=memory_size)
-        self.experience = namedtuple('Experience', field_names=field_names)
+        self.field_names = field_names
+        self.experience = namedtuple("Experience", field_names=self.field_names)
         self.counter = 0
         self.device = device
         self.agent_ids = agent_ids
 
     def __len__(self):
         return len(self.memory)
-    
-    def _add(self, state, action, reward, next_state, done):
-        e = self.experience(state, action, reward, next_state, done)
+
+    def _add(self, *args):
+        """Adds experience to memory."""
+        e = self.experience(*args)
         self.memory.append(e)
 
-    def sample(self, batch_size):
+    def _process_transition(self, experiences, np_array=False):
+        """Returns transition dictionary from experiences."""
+        transition = {field: {} for field in self.field_names}
+        experiences_filtered = [e for e in experiences if e is not None]
+
+        for field in self.field_names:
+            # Precompute conditions outside the inner loop
+            is_binary_field = field in [
+                "done",
+                "termination",
+                "terminated",
+                "truncation",
+                "truncated",
+            ]
+
+            for agent_id in self.agent_ids:
+                # Extract all experiences for the current field and agent
+                ts = np.array(
+                    [getattr(e, field)[agent_id] for e in experiences_filtered]
+                )
+
+                # Adjust shape if necessary
+                if ts.ndim == 1:
+                    ts = np.expand_dims(ts, axis=1)
+
+                # Convert binary fields to uint8
+                if is_binary_field:
+                    ts = ts.astype(np.uint8)
+
+                # Optionally convert to PyTorch tensor
+                if not np_array:
+                    ts = torch.tensor(ts, dtype=torch.float32)
+                    if self.device is not None:
+                        ts = ts.to(self.device)
+
+                transition[field][agent_id] = ts
+
+        return transition
+
+    def sample(self, batch_size, *args):
         """Returns sample of experiences from memory.
 
         :param batch_size: Number of samples to return
         :type batch_size: int
         """
         experiences = random.sample(self.memory, k=batch_size)
+        transition = self._process_transition(experiences)
+        return tuple(transition.values())
 
-        if self.device is not None:
-            states = {agent_id: torch.from_numpy(np.stack([e.state[agent_id] for e in experiences])).to(self.device) for agent_id in self.agent_ids}
-            actions = {agent_id: torch.from_numpy(np.stack([e.action[agent_id] for e in experiences])).to(self.device) for agent_id in self.agent_ids}
-            rewards = {agent_id: torch.from_numpy(np.vstack([e.reward[agent_id] for e in experiences])).float().to(self.device) for agent_id in self.agent_ids}
-            next_states = {agent_id: torch.from_numpy(np.stack([e.next_state[agent_id] for e in experiences])).float().to(self.device) for agent_id in self.agent_ids}
-            dones = {agent_id: torch.from_numpy(np.vstack([e.done[agent_id] for e in experiences]).astype(np.uint8)).float().to(self.device) for agent_id in self.agent_ids}
-        else:
-            states = {agent_id: torch.from_numpy(np.stack([e.state[agent_id] for e in experiences])) for agent_id in self.agent_ids}
-            actions = {agent_id: torch.from_numpy(np.stack([e.action[agent_id] for e in experiences])) for agent_id in self.agent_ids}
-            rewards = {agent_id: torch.from_numpy(np.vstack([e.reward[agent_id] for e in experiences])).float() for agent_id in self.agent_ids}
-            next_states = {agent_id: torch.from_numpy(np.stack([e.next_state[agent_id] for e in experiences])).float()for agent_id in self.agent_ids}
-            dones = {agent_id: torch.from_numpy(np.vstack([e.done[agent_id] for e in experiences]).astype(np.uint8)).float() for agent_id in self.agent_ids}
-        
-        return states, actions, rewards, next_states, dones
-
-
-    def save2memory(self, state, action, reward, next_state, done):
+    def save_to_memory_single_env(self, *args):
         """Saves experience to memory.
 
-        :param state: Environment observation
-        :type state: Dict[str, numpy.Array]
-        :param action: Action in environment
-        :type action: Dict[str, numpy.Array]
-        :param reward: Reward from environment
-        :type reward: dict[str, int]
-        :param next_state: Environment observation of next state
-        :type next_state: Dict[str, numpy.Array]
-        :param done: True if environment episode finished, else False
-        :type done: Dict[str, bool]
+        :param *args: Variable length argument list. Contains transition elements in consistent order,
+            e.g. state, action, reward, next_state, done
         """
-        self._add(state, action, reward, next_state, done)
+        self._add(*args)
         self.counter += 1
 
-    
-        
+    def _reorganize_dicts(self, *args):
+        """Reorgansizes dictionaries from vectorised to unvectorized experiences.
 
+        Example input:
+        {"agent1": np.array([[1, 2], [3, 4]]), "agent2": np.array([[1, 2], [3, 4]])}
 
+        Example output:
+        [{'agent1': array([[1, 2]]), 'agent2': array([[1, 2]])},
+         {'agent1': array([[3, 4]]), 'agent2': array([[3, 4]])}]
+        """
+        results = [[] for _ in range(len(args))]
+        num_entries = len(next(iter(args[0].values())))
+        for i in range(num_entries):
+            for j, arg in enumerate(args):
+                new_dict = {
+                    key: (
+                        np.array(value[i])
+                        if not isinstance(value[i], np.ndarray)
+                        else value[i]
+                    )
+                    for key, value in arg.items()
+                }
+                results[j].append(new_dict)
+        return tuple(results)
+
+    def save_to_memory_vect_envs(self, *args):
+        """Saves multiple experiences to memory.
+
+        :param *args: Variable length argument list. Contains batched transition elements in consistent order,
+            e.g. states, actions, rewards, next_states, dones
+        """
+        args = self._reorganize_dicts(*args)
+        for transition in zip(*args):
+            self._add(*transition)
+            self.counter += 1
+
+    def save_to_memory(self, *args, is_vectorised=False):
+        """Applies appropriate save_to_memory function depending on whether
+        the environment is vectorised or not.
+
+        :param *args: Variable length argument list. Contains batched or unbatched transition elements in consistent order,
+            e.g. states, actions, rewards, next_states, dones
+        :param is_vectorised: Boolean flag indicating if the environment has been vectorised
+        :type is_vectorised: bool
+        """
+        if is_vectorised:
+            self.save_to_memory_vect_envs(*args)
+        else:
+            self.save_to_memory_single_env(*args)
