@@ -1,24 +1,32 @@
+.. _algorithms:
+
 Algorithms
 ==========
 
-Reinforcement learning algorithms implemented: (More coming soon!)
-    * CQL
-    * DDPG
-    * DQN
-    * ILQL
-    * TD3
-    * MADDPG
-    * MATD3
+AgileRL already includes state-of-the-art evolvable on-policy, off-policy, offline and multi-agent reinforcement learning algorithms with distributed training. We are constantly adding more algorithms, with a view to add hierarchical algorithms soon.
 
-We are constantly adding more algorithms, with a view to add hierarchical and multi-agent algorithms soon.
+Core algorithm tools:
 
 .. toctree::
-   :maxdepth: 2
+   :maxdepth: 1
+
+   base
+   registry
+   wrappers
+
+Reinforcement learning algorithms implemented:
+
+.. toctree::
+   :maxdepth: 1
 
    cql
    ddpg
    dqn
+   dqn_rainbow
    ilql
+   ppo
    td3
    maddpg
    matd3
+   neural_ucb
+   neural_ts

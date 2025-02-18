@@ -1,3 +1,5 @@
+.. _dqn:
+
 Deep Q-Learning (DQN)
 =====================
 
@@ -6,13 +8,13 @@ DQN is an extension of Q-learning that makes use of a replay buffer and target n
 * DQN paper: https://arxiv.org/abs/1312.5602
 
 Can I use it?
-------------
+--------------
 
 .. list-table::
    :widths: 20 20 20
    :header-rows: 1
 
-   * - 
+   * -
      - Action
      - Observation
    * - Discrete
@@ -28,76 +30,127 @@ Example
 .. code-block:: python
 
   import gymnasium as gym
-  from agilerl.utils import makeVectEnvs
+  from agilerl.utils.algo_utils import obs_channels_to_first
+  from agilerl.utils.utils import make_vect_envs, observation_space_channels_to_first
   from agilerl.components.replay_buffer import ReplayBuffer
   from agilerl.algorithms.dqn import DQN
 
   # Create environment and Experience Replay Buffer
-  env = makeVectEnvs('LunarLander-v2', num_envs=1)
-  try:
-      state_dim = env.single_observation_space.n          # Discrete observation space
-      one_hot = True                                      # Requires one-hot encoding
-  except:
-      state_dim = env.single_observation_space.shape      # Continuous observation space
-      one_hot = False                                     # Does not require one-hot encoding
-  try:
-      action_dim = env.single_action_space.n              # Discrete action space
-  except:
-      action_dim = env.single_action_space.shape[0]       # Continuous action space
+  num_envs = 8
+  env = make_vect_envs('LunarLander-v2', num_envs=num_envs)
+  observation_space = env.observation_space
+  action_space = env.action_space
 
   channels_last = False # Swap image channels dimension from last to first [H, W, C] -> [C, H, W]
 
   if channels_last:
-      state_dim = (state_dim[2], state_dim[0], state_dim[1])
+      observation_space = observation_space_channels_to_first(observation_space)
 
   field_names = ["state", "action", "reward", "next_state", "done"]
-  memory = ReplayBuffer(action_dim=action_dim, memory_size=10000, field_names=field_names)
+  memory = ReplayBuffer(memory_size=10000, field_names=field_names)
 
-  agent = DQN(state_dim=state_dim, action_dim=action_dim, one_hot=one_hot)   # Create DQN agent
+  agent = DQN(observation_space, action_space)   # Create DQN agent
 
   state = env.reset()[0]  # Reset environment at start of episode
   while True:
       if channels_last:
-          state = np.moveaxis(state, [3], [1])
-      action = agent.getAction(state, epsilon)    # Get next action from agent
+          state = obs_channels_to_first(state)
+      action = agent.get_action(state, epsilon)    # Get next action from agent
       next_state, reward, done, _, _ = env.step(action)   # Act in environment
 
       # Save experience to replay buffer
       if channels_last:
-          memory.save2memoryVectEnvs(state, action, reward, np.moveaxis(next_state, [3], [1]), done)
+          memory.save_to_memory_vect_envs(state, action, reward, obs_channels_to_first(next_state), done)
       else:
-          memory.save2memoryVectEnvs(state, action, reward, next_state, done)
+          memory.save_to_memory_vect_envs(state, action, reward, next_state, done)
 
       # Learn according to learning frequency
-      if memory.counter % agent.learn_step == 0 and len(memory) >= agent.batch_size:
-          experiences = memory.sample(agent.batch_size) # Sample replay buffer
-          agent.learn(experiences)    # Learn according to agent's RL algorithm
+      if len(memory) >= agent.batch_size:
+          for _ in range(num_envs // agent.learn_step):
+              experiences = memory.sample(agent.batch_size) # Sample replay buffer
+              agent.learn(experiences)    # Learn according to agent's RL algorithm
 
-To configure the network architecture, pass a dict to the DQN ``net_config`` field. For an MLP, this can be as simple as:
+Neural Network Configuration
+----------------------------
+
+To configure the architecture of the network's encoder / head, pass a kwargs dict to the DQN ``net_config`` field.
+Full arguments can be found in the documentation of :ref:`EvolvableMLP<mlp>`, :ref:`EvolvableCNN<cnn>`, and
+:ref:`EvolvableMultiInput<multi_input>`.
+
+For discrete / vector observations:
 
 .. code-block:: python
 
   NET_CONFIG = {
-        'arch': 'mlp',      # Network architecture
-        'h_size': [32, 32]  # Network hidden size
+        "encoder_config": {'hidden_size': [32, 32]},  # Network head hidden size
+        "head_config": {'hidden_size': [32]}      # Network head hidden size
     }
 
-Or for a CNN:
+For image observations:
 
 .. code-block:: python
 
   NET_CONFIG = {
-        'arch': 'cnn',      # Network architecture
-        'h_size': [128],    # Network hidden size
-        'c_size': [32, 32], # CNN channel size
-        'k_size': [8, 4],   # CNN kernel size
-        's_size': [4, 2],   # CNN stride size
-        'normalize': True   # Normalize image from range [0,255] to [0,1]
+      "encoder_config": {
+        'channel_size': [32, 32], # CNN channel size
+        'kernel_size': [8, 4],   # CNN kernel size
+        'stride_size': [4, 2],   # CNN stride size
+      },
+      "head_config": {'hidden_size': [32]}  # Network head hidden size
     }
+
+For dictionary / tuple observations containing any combination of image, discrete, and vector observations:
 
 .. code-block:: python
 
-  agent = DQN(state_dim=state_dim, action_dim=action_dim, one_hot=one_hot, net_config=NET_CONFIG)   # Create DQN agent  
+  NET_CONFIG = {
+      "encoder_config": {
+        'hidden_size': [32, 32],  # Network head hidden size
+        'channel_size': [32, 32], # CNN channel size
+        'kernel_size': [8, 4],   # CNN kernel size
+        'stride_size': [4, 2],   # CNN stride size
+      },
+      "head_config": {'hidden_size': [32]}  # Network head hidden size
+    }
+
+
+.. code-block:: python
+
+  # Create DQN agent
+  agent = DQN(
+    observation_space=observation_space,
+    action_space=action_space,
+    net_config=NET_CONFIG
+    )
+
+Evolutionary Hyperparameter Optimization
+----------------------------------------
+
+AgileRL allows for efficient hyperparameter optimization during training to provide state-of-the-art results in a fraction of the time.
+For more information on how this is done, please refer to the :ref:`Evolutionary Hyperparameter Optimization <evo_hyperparam_opt>` documentation.
+
+Saving and loading agents
+-------------------------
+
+To save an agent, use the ``save_checkpoint`` method:
+
+.. code-block:: python
+
+  from agilerl.algorithms.dqn import DQN
+
+  agent = DQN(observation_space, action_space)   # Create DQN agent
+
+  checkpoint_path = "path/to/checkpoint"
+  agent.save_checkpoint(checkpoint_path)
+
+To load a saved agent, use the ``load`` method:
+
+.. code-block:: python
+
+  from agilerl.algorithms.dqn import DQN
+
+  checkpoint_path = "path/to/checkpoint"
+  agent = DQN.load(checkpoint_path)
 
 Parameters
 ------------

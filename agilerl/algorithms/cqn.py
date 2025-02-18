@@ -1,27 +1,35 @@
 import random
-import copy
-import dill
+from typing import Any, Dict, Optional, Tuple
+
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.nn.utils import clip_grad_norm_
 import torch.optim as optim
-from agilerl.networks.evolvable_mlp import EvolvableMLP
-from agilerl.networks.evolvable_cnn import EvolvableCNN
+from gymnasium import spaces
+from numpy.typing import ArrayLike
+from torch.nn.utils import clip_grad_norm_
+
+from agilerl.algorithms.core import RLAlgorithm
+from agilerl.algorithms.core.registry import HyperparameterConfig, NetworkGroup
+from agilerl.algorithms.core.wrappers import OptimizerWrapper
+from agilerl.modules.base import EvolvableModule
+from agilerl.networks.q_networks import QNetwork
+from agilerl.typing import GymEnvType, NumpyObsType
+from agilerl.utils.algo_utils import make_safe_deepcopies, obs_channels_to_first
 
 
-class CQN():
+class CQN(RLAlgorithm):
     """The CQN algorithm class. CQN paper: https://arxiv.org/abs/2006.04779
 
-    :param state_dim: State observation dimension
-    :type state_dim: int
-    :param action_dim: Action dimension
-    :type action_dim: int
-    :param one_hot: One-hot encoding, used with discrete observation spaces
-    :type one_hot: bool
+    :param observation_space: The observation space of the environment.
+    :type observation_space: spaces.Space
+    :param action_space: The action space of the environment.
+    :type action_space: spaces.Space
     :param index: Index to keep track of object instance during tournament selection and mutation, defaults to 0
     :type index: int, optional
-    :param net_config: Network configuration, defaults to mlp with hidden size [64,64]
+    :param hp_config: RL hyperparameter mutation configuration, defaults to None, whereby algorithm mutations are disabled.
+    :type hp_config: HyperparameterConfig, optional
+    :param net_config: Network configuration, defaults to None
     :type net_config: dict, optional
     :param batch_size: Size of batched sample from replay buffer for learning, defaults to 64
     :type batch_size: int, optional
@@ -33,155 +41,201 @@ class CQN():
     :type gamma: float, optional
     :param tau: For soft update of target network parameters, defaults to 1e-3
     :type tau: float, optional
-    :param mutation: Most recent mutation to agent, defaults to None
-    :type mutation: str, optional
     :param double: Use double Q-learning, defaults to False
     :type double: bool, optional
+    :param normalize_images: Normalize image observations, defaults to True
+    :type normalize_images: bool, optional
+    :param mut: Most recent mutation to agent, defaults to None
+    :type mut: str, optional
+    :param actor_network: Custom actor network, defaults to None
+    :type actor_network: nn.Module, optional
     :param device: Device for accelerated computing, 'cpu' or 'cuda', defaults to 'cpu'
     :type device: str, optional
     :param accelerator: Accelerator for distributed computing, defaults to None
-    :type accelerator: Hugging Face accelerate.Accelerator(), optional
+    :type accelerator: accelerate.Accelerator(), optional
     :param wrap: Wrap models for distributed training upon creation, defaults to True
     :type wrap: bool, optional
     """
 
-    def __init__(self, state_dim, action_dim, one_hot, index=0, 
-                 net_config={'arch': 'mlp', 'h_size':[64, 64]}, batch_size=64, lr=1e-4,
-                 learn_step=5, gamma=0.99, tau=1e-3, mutation=None, double=False,
-                 device='cpu', accelerator=None, wrap=True):
-        self.algo = 'CQN'
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.one_hot = one_hot
-        self.net_config = net_config
+    def __init__(
+        self,
+        observation_space: spaces.Space,
+        action_space: spaces.Space,
+        index: int = 0,
+        hp_config: Optional[HyperparameterConfig] = None,
+        net_config: Optional[Dict[str, Any]] = None,
+        batch_size: int = 64,
+        lr: float = 1e-4,
+        learn_step: int = 5,
+        gamma: float = 0.99,
+        tau: float = 1e-3,
+        double: bool = False,
+        normalize_images: bool = True,
+        mut: Optional[str] = None,
+        actor_network: Optional[EvolvableModule] = None,
+        device: str = "cpu",
+        accelerator: Optional[Any] = None,
+        wrap: bool = True,
+    ) -> None:
+
+        super().__init__(
+            observation_space,
+            action_space,
+            index=index,
+            hp_config=hp_config,
+            device=device,
+            accelerator=accelerator,
+            normalize_images=normalize_images,
+            name="CQN",
+        )
+
+        assert learn_step >= 1, "Learn step must be greater than or equal to one."
+        assert isinstance(learn_step, int), "Learn step rate must be an integer."
+        assert isinstance(batch_size, int), "Batch size must be an integer."
+        assert batch_size >= 1, "Batch size must be greater than or equal to one."
+        assert isinstance(lr, float), "Learning rate must be a float."
+        assert lr > 0, "Learning rate must be greater than zero."
+        assert isinstance(learn_step, int), "Learn step rate must be an integer."
+        assert learn_step >= 1, "Learn step must be greater than or equal to one."
+        assert isinstance(gamma, (float, int, torch.Tensor)), "Gamma must be a float."
+        assert isinstance(tau, float), "Tau must be a float."
+        assert tau > 0, "Tau must be greater than zero."
+        assert isinstance(
+            double, bool
+        ), "Double Q-learning flag must be boolean value True or False."
+        assert isinstance(
+            wrap, bool
+        ), "Wrap models flag must be boolean value True or False."
+
         self.batch_size = batch_size
         self.lr = lr
-        self.learn_step = learn_step
         self.gamma = gamma
+        self.learn_step = learn_step
         self.tau = tau
-        self.mut = mutation
-        self.device = device
-        self.accelerator = accelerator
-
-        self.index = index
-        self.scores = []
-        self.fitness = []
-        self.steps = [0]
-
+        self.mut = mut
         self.double = double
+        self.net_config = net_config
 
-        # model
-        if self.net_config['arch'] == 'mlp':      # Multi-layer Perceptron
-            self.actor = EvolvableMLP(
-                num_inputs=state_dim[0],
-                num_outputs=action_dim,
-                hidden_size=self.net_config['h_size'],
-                device=self.device,
-                accelerator=self.accelerator)
-            self.actor_target = EvolvableMLP(
-                num_inputs=state_dim[0],
-                num_outputs=action_dim,
-                hidden_size=self.net_config['h_size'],
-                device=self.device,
-                accelerator=self.accelerator)
-            self.actor_target.load_state_dict(self.actor.state_dict())
+        if actor_network is not None:
+            if not isinstance(actor_network, EvolvableModule):
+                raise TypeError(
+                    f"'actor_network' argument is of type {type(actor_network)}, but must be of type EvolvableModule."
+                )
 
-        elif self.net_config['arch'] == 'cnn':    # Convolutional Neural Network
-            self.actor = EvolvableCNN(
-                input_shape=state_dim,
-                num_actions=action_dim,
-                channel_size=self.net_config['c_size'],
-                kernal_size=self.net_config['k_size'],
-                stride_size=self.net_config['s_size'],
-                hidden_size=self.net_config['h_size'],
-                normalize=self.net_config['normalize'],
-                device=self.device,
-                accelerator=self.accelerator)
-            self.actor_target = EvolvableCNN(
-                input_shape=state_dim,
-                num_actions=action_dim,
-                channel_size=self.net_config['c_size'],
-                kernal_size=self.net_config['k_size'],
-                stride_size=self.net_config['s_size'],
-                hidden_size=self.net_config['h_size'],
-                normalize=self.net_config['normalize'],
-                device=self.device,
-                accelerator=self.accelerator)
-            self.actor_target.load_state_dict(self.actor.state_dict())
-
-        self.optimizer_type = optim.Adam(self.actor.parameters(), lr=self.lr)
-
-        if self.accelerator is not None:
-            self.optimizer = self.optimizer_type
-            if wrap:
-                self.wrap_models()
+            # Need to make deepcopies for target and detached networks
+            self.actor, self.actor_target = make_safe_deepcopies(
+                actor_network, actor_network
+            )
         else:
-            self.actor = self.actor.to(self.device)
-            self.actor_target = self.actor_target.to(self.device)
-            self.optimizer = self.optimizer_type
+            net_config = {} if net_config is None else net_config
+
+            def create_actor():
+                return QNetwork(
+                    observation_space=observation_space,
+                    action_space=action_space,
+                    device=self.device,
+                    **net_config,
+                )
+
+            self.actor = create_actor()
+            self.actor_target = create_actor()
+
+        self.actor_target.load_state_dict(self.actor.state_dict())
+
+        # Initialize optimizer
+        self.optimizer = OptimizerWrapper(
+            optim.Adam,
+            networks=self.actor,
+            lr=self.lr,
+        )
+
+        if self.accelerator is not None and wrap:
+            self.wrap_models()
 
         self.criterion = nn.MSELoss()
 
-    def getAction(self, state, epsilon=0):
-        """Returns the next action to take in the environment. Epsilon is the 
+        # Register policy for mutations
+        self.register_network_group(
+            NetworkGroup(eval=self.actor, shared=self.actor_target, policy=True)
+        )
+
+    def get_action(
+        self,
+        obs: NumpyObsType,
+        epsilon: float = 0,
+        action_mask: Optional[ArrayLike] = None,
+    ) -> ArrayLike:
+        """Returns the next action to take in the environment. Epsilon is the
         probability of taking a random action, used for exploration.
-        For epsilon-greedy behaviour, set epsilon to 0.
+        For greedy behaviour, set epsilon to 0.
 
         :param state: State observation, or multiple observations in a batch
-        :type state: float or List[float]
+        :type state: numpy.ndarray[float]
         :param epsilon: Probablilty of taking a random action for exploration, defaults to 0
         :type epsilon: float, optional
+        :param action_mask: Mask of legal actions 1=legal 0=illegal, defaults to None
+        :type action_mask: numpy.ndarray, optional
+
+        :return: Action to take in the environment
+        :rtype: numpy.ndarray[int]
         """
-        state = torch.from_numpy(state).float()
-        if self.accelerator is None:
-            state = state.to(self.device)
-
-        if self.one_hot:
-            state = nn.functional.one_hot(
-                state.long(), num_classes=self.state_dim[0]).float().squeeze()
-
-        if len(state.size()) < 2:
-            state = state.unsqueeze(0)
+        state = self.preprocess_observation(obs)
 
         # epsilon-greedy
         if random.random() < epsilon:
-            action = np.random.randint(0, self.action_dim, size=state.size()[0])
+            if action_mask is None:
+                action = np.random.randint(0, self.action_dim, size=len(state))
+            else:
+                action = np.argmax(
+                    (
+                        np.random.uniform(0, 1, (len(state), self.action_dim))
+                        * action_mask
+                    ),
+                    axis=1,
+                )
+
         else:
             self.actor.eval()
             with torch.no_grad():
-                action_values = self.actor(state)
+                action_values = self.actor(state).cpu().data.numpy()
             self.actor.train()
-            action = np.argmax(action_values.cpu().data.numpy(), axis=1)
-        return action
-    
-    def _squeeze_exp(self, experiences):
-        """Remove first dim created by dataloader.
-        
-        :param experiences: List of batched states, actions, rewards, next_states, dones in that order.
-        :type state: List[torch.Tensor[float]]
-        """
-        st, ac, re, ne, do = experiences
-        return st.squeeze(0), ac.squeeze(0), re.squeeze(0), ne.squeeze(0), do.squeeze(0)
 
-    def learn(self, experiences):
+            if action_mask is None:
+                action = np.argmax(action_values, axis=-1)
+            else:
+                inv_mask = 1 - action_mask
+                masked_action_values = np.ma.array(action_values, mask=inv_mask)
+                action = np.argmax(masked_action_values, axis=-1)
+
+        return action
+
+    def learn(self, experiences: Tuple[torch.Tensor, ...]) -> float:
         """Updates agent network parameters to learn from experiences.
 
         :param experiences: List of batched states, actions, rewards, next_states, dones in that order.
-        :type state: List[torch.Tensor[float]]
+        :type state: list[torch.Tensor[float]]
+
+        :return: Loss from learning
+        :rtype: float
         """
         states, actions, rewards, next_states, dones = experiences
+        if self.accelerator is not None:
+            actions = actions.to(self.accelerator.device)
+            rewards = rewards.to(self.accelerator.device)
+            dones = dones.to(self.accelerator.device)
 
-        if self.one_hot:
-            states = nn.functional.one_hot(
-                states.long(), num_classes=self.state_dim[0]).float().squeeze()
-            next_states = nn.functional.one_hot(
-                next_states.long(), num_classes=self.state_dim[0]).float().squeeze()
+        states = self.preprocess_observation(states)
+        next_states = self.preprocess_observation(next_states)
 
-        if self.double: # Double Q-learning
-            q_idx = self.actor_target(next_states).argmax(dim=1).unsqueeze(1)
-            q_target_next = self.actor(next_states).gather(dim=1, index=q_idx).detach()
+        if self.double:  # Double Q-learning
+            q_idx = self.actor(next_states).argmax(dim=1).unsqueeze(1)
+            q_target_next = (
+                self.actor_target(next_states).gather(dim=1, index=q_idx).detach()
+            )
         else:
-            q_target_next = self.actor_target(next_states).detach().max(axis=1)[0].unsqueeze(1)
+            q_target_next = (
+                self.actor_target(next_states).detach().max(axis=1)[0].unsqueeze(1)
+            )
 
         # target, if terminal then y_j = rewards
         q_target = rewards + self.gamma * q_target_next * (1 - dones)
@@ -197,158 +251,67 @@ class CQN():
             self.accelerator.backward(q1_loss)
         else:
             q1_loss.backward()
+
         clip_grad_norm_(self.actor.parameters(), 1)
         self.optimizer.step()
 
         # soft update target network
-        self.softUpdate()
+        self.soft_update()
 
-    def softUpdate(self):
-        """Soft updates target network.
-        """
+        return q1_loss.item()
+
+    def soft_update(self) -> None:
+        """Soft updates target network."""
         for eval_param, target_param in zip(
-                self.actor.parameters(), self.actor_target.parameters()):
+            self.actor.parameters(), self.actor_target.parameters()
+        ):
             target_param.data.copy_(
-                self.tau * eval_param.data + (1.0 - self.tau) * target_param.data)
+                self.tau * eval_param.data + (1.0 - self.tau) * target_param.data
+            )
 
-    def test(self, env, swap_channels=False, max_steps=500, loop=3):
+    def test(
+        self,
+        env: GymEnvType,
+        swap_channels: bool = False,
+        max_steps: Optional[int] = None,
+        loop: int = 3,
+    ):
         """Returns mean test score of agent in environment with epsilon-greedy policy.
 
         :param env: The environment to be tested in
         :type env: Gym-style environment
         :param swap_channels: Swap image channels dimension from last to first [H, W, C] -> [C, H, W], defaults to False
         :type swap_channels: bool, optional
-        :param max_steps: Maximum number of testing steps, defaults to 500
+        :param max_steps: Maximum number of testing steps, defaults to None.
         :type max_steps: int, optional
-        :param loop: Number of testing loops/epsiodes to complete. The returned score is the mean. Defaults to 3
+        :param loop: Number of testing loops/episodes to complete. The returned score is the mean. Defaults to 3
         :type loop: int, optional
         """
         with torch.no_grad():
             rewards = []
+            num_envs = env.num_envs if hasattr(env, "num_envs") else 1
             for i in range(loop):
-                state = env.reset()[0]
-                score = 0
-                for idx_step in range(max_steps):
+                state, info = env.reset()
+                scores = np.zeros(num_envs)
+                completed_episode_scores = np.zeros(num_envs)
+                finished = np.zeros(num_envs)
+                step = 0
+                while not np.all(finished):
                     if swap_channels:
-                        state = np.moveaxis(state, [3], [1])
-                    action = self.getAction(state, epsilon=0)
-                    state, reward, done, _, _ = env.step(action)
-                    score += reward
-                    if done:
-                        break
-                rewards.append(score)
+                        state = obs_channels_to_first(state)
+
+                    action_mask = info.get("action_mask", None)
+                    action = self.get_action(state, epsilon=0, action_mask=action_mask)
+                    state, reward, done, trunc, info = env.step(action)
+                    step += 1
+                    scores += np.array(reward)
+                    for idx, (d, t) in enumerate(zip(done, trunc)):
+                        if (
+                            d or t or (max_steps is not None and step == max_steps)
+                        ) and not finished[idx]:
+                            completed_episode_scores[idx] = scores[idx]
+                            finished[idx] = 1
+                rewards.append(np.mean(completed_episode_scores))
         mean_fit = np.mean(rewards)
         self.fitness.append(mean_fit)
         return mean_fit
-
-    def clone(self, index=None, wrap=True):
-        """Returns cloned agent identical to self.
-
-        :param index: Index to keep track of agent for tournament selection and mutation, defaults to None
-        :type index: int, optional
-        """
-        if index is None:
-            index = self.index
-
-        clone = type(self)(state_dim=self.state_dim,
-                           action_dim=self.action_dim,
-                           one_hot=self.one_hot,
-                           index=index,
-                           net_config=self.net_config,
-                           batch_size=self.batch_size,
-                           lr=self.lr,
-                           learn_step=self.learn_step,
-                           gamma=self.gamma,
-                           tau=self.tau,
-                           mutation=self.mut,
-                           device=self.device,
-                           accelerator=self.accelerator,
-                           wrap=wrap)
-
-        actor = self.actor.clone()
-        actor_target = self.actor_target.clone()
-        optimizer = optim.Adam(actor.parameters(), lr=clone.lr)
-        clone.optimizer_type = optimizer
-        if self.accelerator is not None:
-            if wrap:
-                clone.actor, clone.actor_target, clone.optimizer = self.accelerator.prepare(
-                                                                                        actor, 
-                                                                                        actor_target,
-                                                                                        optimizer)
-            else:
-                clone.actor, clone.actor_target, clone.optimizer = actor, actor_target, optimizer
-        else:
-            clone.actor = actor.to(self.device)
-            clone.actor_target = actor_target.to(self.device)
-            clone.optimizer = optimizer
-        clone.fitness = copy.deepcopy(self.fitness)
-        clone.steps = copy.deepcopy(self.steps)
-        clone.scores = copy.deepcopy(self.scores)
-
-        return clone
-    
-    def wrap_models(self):
-        if self.accelerator is not None:
-            self.actor, self.actor_target, self.optimizer = self.accelerator.prepare(self.actor, 
-                                                                            self.actor_target, 
-                                                                            self.optimizer)
-    
-    def unwrap_models(self):
-        if self.accelerator is not None:
-            self.actor = self.accelerator.unwrap_model(self.actor)
-            self.actor_target = self.accelerator.unwrap_model(self.actor_target)
-            self.optimizer = self.accelerator.unwrap_model(self.optimizer)
-
-    def saveCheckpoint(self, path):
-        """Saves a checkpoint of agent properties and network weights to path.
-
-        :param path: Location to save checkpoint at
-        :type path: string
-        """
-        torch.save({
-            'actor_init_dict': self.actor.init_dict,
-            'actor_state_dict': self.actor.state_dict(),
-            'actor_target_init_dict': self.actor_target.init_dict,
-            'actor_target_state_dict': self.actor_target.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'net_config': self.net_config,
-            'batch_size': self.batch_size,
-            'lr': self.lr,
-            'learn_step': self.learn_step,
-            'gamma': self.gamma,
-            'tau': self.tau,
-            'mutation': self.mut,
-            'index': self.index,
-            'scores': self.scores,
-            'fitness': self.fitness,
-            'steps': self.steps,
-        }, path, pickle_module=dill)
-
-    def loadCheckpoint(self, path):
-        """Loads saved agent properties and network weights from checkpoint.
-
-        :param path: Location to load checkpoint from
-        :type path: string
-        """
-        checkpoint = torch.load(path, pickle_module=dill)
-        self.net_config = checkpoint['net_config']
-        if self.net_config['arch'] == 'mlp':
-            self.actor = EvolvableMLP(**checkpoint['actor_init_dict'])
-            self.actor_target = EvolvableMLP(**checkpoint['actor_target_init_dict'])
-        elif self.net_config['arch'] == 'cnn':
-            self.actor = EvolvableCNN(**checkpoint['actor_init_dict'])
-            self.actor_target = EvolvableCNN(**checkpoint['actor_target_init_dict'])
-        self.lr = checkpoint['lr']
-        self.optimizer = optim.Adam(self.actor.parameters(), lr=self.lr)
-        self.actor.load_state_dict(checkpoint['actor_state_dict'])
-        self.actor_target.load_state_dict(checkpoint['actor_target_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.batch_size = checkpoint['batch_size']
-        self.learn_step = checkpoint['learn_step']
-        self.gamma = checkpoint['gamma']
-        self.tau = checkpoint['tau']
-        self.mut = checkpoint['mutation']
-        self.index = checkpoint['index']
-        self.scores = checkpoint['scores']
-        self.fitness = checkpoint['fitness']
-        self.steps = checkpoint['steps']
