@@ -1,17 +1,18 @@
+from __future__ import annotations
+
 import copy
 import gc
 import inspect
 import os
-import re
+import pickle
 import tempfile
 import warnings
 from abc import ABC, ABCMeta, abstractmethod
 from collections import OrderedDict, defaultdict
 from collections.abc import Callable, Iterable
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict
 from importlib.metadata import version
-from itertools import repeat
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -23,7 +24,6 @@ from typing import (
 import dill
 import numpy as np
 import torch
-import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import broadcast_object_list, set_seed
 from gymnasium import spaces
@@ -31,10 +31,9 @@ from tensordict import TensorDict
 from torch._dynamo import OptimizedModule
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import SequentialLR
 from typing_extensions import Self
 
-from agilerl import HAS_LLM_DEPENDENCIES
+from agilerl import HAS_DEEPSPEED, HAS_LIGER_KERNEL, HAS_LLM_DEPENDENCIES, HAS_VLLM
 from agilerl.algorithms.core.optimizer_wrapper import OptimizerWrapper
 from agilerl.algorithms.core.registry import (
     HyperparameterConfig,
@@ -49,7 +48,6 @@ from agilerl.protocols import (
     EvolvableAttributeDict,
     EvolvableAttributeType,
     EvolvableModuleProtocol,
-    LoraConfigProtocol,
     ModuleDictProtocol,
     PeftModelProtocol,
     PretrainedConfigProtocol,
@@ -58,6 +56,7 @@ from agilerl.protocols import (
 from agilerl.typing import (
     ActionType,
     ArrayDict,
+    CheckpointInfo,
     DeviceType,
     ExperiencesType,
     GymSpaceType,
@@ -74,9 +73,11 @@ from agilerl.utils.algo_utils import (
     CosineLRScheduleConfig,
     DummyOptimizer,
     VLLMConfig,
+    _resolve_lr,
     check_supported_space,
     chkpt_attribute_to_device,
     clone_llm,
+    concatenate_tensors,
     create_warmup_cosine_scheduler,
     filter_init_dict,
     get_input_size_from_space,
@@ -99,36 +100,44 @@ from agilerl.utils.evolvable_networks import (
 
 if TYPE_CHECKING:
     from accelerate.utils.deepspeed import DeepSpeedOptimizerWrapper
+    from torch.optim.lr_scheduler import SequentialLR
 
-if HAS_LLM_DEPENDENCIES:
-    try:
-        from deepspeed.checkpoint.utils import clone_tensors_for_torch_save
-    except ImportError:
-
-        def clone_tensors_for_torch_save(
-            item: Any,
-            *args: Any,
-            **kwargs: Any,
-        ) -> Any:
-            return item
-
-    from peft import LoraConfig, get_peft_model, set_peft_model_state_dict
+# Make imports visible to typechecker and import when required
+if TYPE_CHECKING or HAS_LLM_DEPENDENCIES:
+    from peft import (
+        LoraConfig,
+        get_peft_model,
+        get_peft_model_state_dict,
+        set_peft_model_state_dict,
+    )
     from safetensors.torch import load_file
 
-    try:
-        from vllm import LLM, SamplingParams
-    except ImportError:
-        LLM = None
-        SamplingParams = None
+    from agilerl.utils.llm_utils import create_model_from_name_or_path, gather_if_zero3
 
+if TYPE_CHECKING or HAS_DEEPSPEED:
+    from deepspeed.checkpoint.utils import clone_tensors_for_torch_save
+
+if TYPE_CHECKING or HAS_VLLM:
+    from vllm import LLM, SamplingParams
+
+    from agilerl.algorithms.core.llm_ops.fused_lora import (
+        clear_fused_adapter_routing,
+        patch_lora_for_fused_forward,
+        set_fused_adapter_routing,
+    )
     from agilerl.utils.llm_utils import (
+        align_deepspeed_lr,
+        build_completion_mask,
         create_model_from_name_or_path,
         gather_if_zero3,
+        get_model_name_or_path,
+        move_params_to_cpu,
+        move_params_to_gpu,
+        stitch_completion_after_windowed_vllm_generate,
     )
 
 __all__ = ["EvolvableAlgorithm", "MultiAgentRLAlgorithm", "RLAlgorithm"]
 
-SelfEvolvableAlgorithm = TypeVar("SelfEvolvableAlgorithm", bound="EvolvableAlgorithm")
 SelfAgentWrapper = TypeVar("SelfAgentWrapper", bound=AgentWrapperProtocol)
 
 
@@ -138,12 +147,12 @@ class _RegistryMeta(type):
     """
 
     def __call__(
-        cls: type[SelfEvolvableAlgorithm],
+        cls: type[EvolvableAlgorithm],  # type: ignore[misc]
         *args: Any,
         **kwargs: Any,
-    ) -> SelfEvolvableAlgorithm:
+    ) -> EvolvableAlgorithm:
         # Create the instance
-        instance: SelfEvolvableAlgorithm = super().__call__(*args, **kwargs)
+        instance: EvolvableAlgorithm = super().__call__(*args, **kwargs)  # type: ignore[misc]
 
         # Call the base class post_init_hook after all initialization
         if isinstance(instance, cls) and hasattr(instance, "_registry_init"):
@@ -157,8 +166,9 @@ class RegistryMeta(_RegistryMeta, ABCMeta):
 
 
 def get_checkpoint_dict(
-    agent: SelfEvolvableAlgorithm,
-    using_deepspeed: bool = False,
+    agent: EvolvableAlgorithm,
+    omit_actor_info: bool = False,
+    omit_optimizer_info: bool = False,
 ) -> dict[str, Any]:
     """Return a dictionary of the agent's attributes to save in a checkpoint.
 
@@ -166,9 +176,12 @@ def get_checkpoint_dict(
 
     :param agent: The agent to save.
     :type agent: EvolvableAlgorithm
-    :param using_deepspeed: Whether the agent is using deepspeed.
-    :type using_deepspeed: bool, optional
-
+    :param omit_actor_info: Whether to remove the 'actor' attribute prior to saving.
+        To be used when saving LoRA weights only or when using Deepspeed.
+    :type omit_actor_info: bool, optional
+    :param omit_optimizer_info: Whether to remove the 'optimizer' attribute prior to saving.
+        To be used when saving LoRA weights only or when using Deepspeed.
+    :type omit_optimizer_info: bool, optional
     :return: A dictionary of the agent's attributes.
     :rtype: dict[str, Any]
     """
@@ -177,39 +190,37 @@ def get_checkpoint_dict(
     attribute_dict = EvolvableAlgorithm.inspect_attributes(agent)
     attribute_dict["agilerl_version"] = version("agilerl")
     attribute_dict.pop("accelerator", None)
+    attribute_dict.pop("rollout_buffer", None)
 
+    # NOTE: this feels messy, refactor this to be more elegant
+    if omit_actor_info and "actor" in attribute_dict:
+        attribute_dict.pop("actor", None)
+    if omit_optimizer_info and "optimizer" in attribute_dict:
+        attribute_dict.pop("optimizer", None)
     if attribute_dict.pop("lr_scheduler", None) is not None:
         attribute_dict["lr_scheduler"] = agent.lr_scheduler.state_dict()
 
-    if using_deepspeed:
-        attribute_dict.pop("actor", None)
-        return attribute_dict
-
-    if "rollout_buffer" in attribute_dict:
-        attribute_dict.pop("rollout_buffer")
-
     # Get checkpoint dictionaries for evolvable modules and optimizers
-    network_info: dict[str, dict[str, Any]] = {"modules": {}, "optimizers": {}}
-    for attr in agent.evolvable_attributes():
-        evolvable_obj: EvolvableAttributeType = getattr(agent, attr)
-        if isinstance(evolvable_obj, (OptimizedModule, EvolvableModule)):
-            module_chkpt = module_checkpoint_dict(evolvable_obj, attr)
-            network_info["modules"].update(module_chkpt)
-        elif isinstance(evolvable_obj, OptimizerWrapper) and not using_deepspeed:
-            optimizer_chkpt = evolvable_obj.checkpoint_dict(attr)
-            network_info["optimizers"].update(optimizer_chkpt)
+    # Use type CheckpointInfo so load code can rely on the key existing.
+    checkpoint_info = CheckpointInfo(
+        modules={},
+        optimizers={},
+        network_names=[],
+        optimizer_names=[],
+    )
 
-    network_attr_names = list(agent.evolvable_attributes(networks_only=True))
-    optimizer_attr_names = [
-        name
-        for name in agent.evolvable_attributes()
-        if isinstance(getattr(agent, name), OptimizerWrapper)
-    ]
+    for name in agent.evolvable_attributes():
+        obj = getattr(agent, name)
+        if isinstance(obj, (OptimizedModule, EvolvableModule)):
+            if not omit_actor_info:
+                checkpoint_info["modules"].update(module_checkpoint_dict(obj, name))
+                checkpoint_info["network_names"].append(name)
+        elif isinstance(obj, OptimizerWrapper):
+            if not omit_optimizer_info:
+                checkpoint_info["optimizers"].update(obj.checkpoint_dict(name))
+                checkpoint_info["optimizer_names"].append(name)
 
-    network_info["network_names"] = network_attr_names
-    network_info["optimizer_names"] = optimizer_attr_names
-    attribute_dict["network_info"] = network_info
-
+    attribute_dict["network_info"] = checkpoint_info
     return attribute_dict
 
 
@@ -389,7 +400,7 @@ class EvolvableAlgorithm(ABC, metaclass=RegistryMeta):
 
     @staticmethod
     def inspect_attributes(
-        agent: SelfEvolvableAlgorithm,
+        agent: EvolvableAlgorithm,
         input_args_only: bool = False,
     ) -> dict[str, Any]:
         """Inspect and retrieve the attributes of the current object, excluding attributes related to the
@@ -431,16 +442,16 @@ class EvolvableAlgorithm(ABC, metaclass=RegistryMeta):
 
     @staticmethod
     def copy_attributes(
-        agent: SelfEvolvableAlgorithm,
-        clone: SelfEvolvableAlgorithm,
-    ) -> SelfEvolvableAlgorithm:
+        agent: EvolvableAlgorithm,
+        clone: EvolvableAlgorithm,
+    ) -> EvolvableAlgorithm:
         """Copy the non-evolvable attributes of the algorithm to a clone.
 
         :param clone: The clone of the algorithm.
-        :type clone: SelfEvolvableAlgorithm
+        :type clone: EvolvableAlgorithm
 
         :return: The clone of the algorithm.
-        :rtype: SelfEvolvableAlgorithm
+        :rtype: EvolvableAlgorithm
         """
         for attribute in EvolvableAlgorithm.inspect_attributes(agent):
             if hasattr(agent, attribute) and hasattr(clone, attribute):
@@ -507,7 +518,7 @@ class EvolvableAlgorithm(ABC, metaclass=RegistryMeta):
         :type size: int.
 
         :return: A list of algorithms.
-        :rtype: list[SelfEvolvableAlgorithm].
+        :rtype: list[EvolvableAlgorithm].
         """
         if wrapper_kwargs is None:
             wrapper_kwargs = {}
@@ -653,7 +664,7 @@ class EvolvableAlgorithm(ABC, metaclass=RegistryMeta):
             self,
             config.name,
         )
-        optimizer = opt.optimizer if hasattr(opt, "optimizer") else None
+        optimizer = getattr(opt, "optimizer", None)
 
         if isinstance(self, LLMAlgorithm):
             if hasattr(self.actor, "optimizer"):
@@ -663,9 +674,14 @@ class EvolvableAlgorithm(ABC, metaclass=RegistryMeta):
             else:
                 optimizer = opt.optimizer
 
+            lr = (
+                tuple(getattr(self, lr_name) for lr_name in config.lr)
+                if isinstance(config.lr, tuple)
+                else getattr(self, config.lr)
+            )
             self.accelerator, self.lr_scheduler = LLMAlgorithm.update_lr(
                 optimizer,
-                lr=getattr(self, config.lr),
+                lr=lr,
                 accelerator=self.accelerator,
                 scheduler_config=self.cosine_lr_schedule_config,
             )
@@ -891,10 +907,14 @@ class EvolvableAlgorithm(ABC, metaclass=RegistryMeta):
             orig_optimizer: OptimizerWrapper = getattr(self, opt_config.name)
 
             networks = [cloned_modules[net] for net in opt_config.networks]
+            optim_cls = opt_config.get_optimizer_cls()
+            lr_value, lr_critic_value = _resolve_lr(self, opt_config.lr)
             opt = OptimizerWrapper(
-                getattr(torch.optim, opt_config.optimizer_cls),
+                optim_cls,
                 networks=networks,
-                lr=orig_optimizer.lr,
+                lr=lr_value,
+                lr_critic=lr_critic_value,
+                is_llm_optimizer=getattr(orig_optimizer, "is_llm_optimizer", False),
                 network_names=opt_config.networks,
                 lr_name=opt_config.lr,
                 optimizer_kwargs=opt_config.optimizer_kwargs,
@@ -1003,15 +1023,18 @@ class EvolvableAlgorithm(ABC, metaclass=RegistryMeta):
             optimizer_cls = get_optimizer_cls(opt_dict[f"{name}_cls"])
             opt_networks = opt_dict[f"{name}_networks"]
             opt_lr = opt_dict[f"{name}_lr"]
+            is_llm_optimizer = bool(opt_dict.get(f"{name}_is_llm_optimizer", False))
+            lr, lr_critic = _resolve_lr(self, opt_lr)
             networks = [getattr(self, net) for net in opt_networks]
-
             optimizer = OptimizerWrapper(
                 optimizer_cls=optimizer_cls,
                 networks=networks,
-                lr=getattr(self, opt_lr),
+                lr=lr,
                 optimizer_kwargs=opt_kwargs,
                 network_names=opt_networks,
                 lr_name=opt_lr,
+                lr_critic=lr_critic,
+                is_llm_optimizer=is_llm_optimizer,
             )
 
             # Load optimizer state
@@ -1169,17 +1192,20 @@ class EvolvableAlgorithm(ABC, metaclass=RegistryMeta):
             # Add device to optimizer kwargs
             opt_kwargs = chkpt_attribute_to_device(opt_dict[f"{name}_kwargs"], device)
             lr = opt_dict[f"{name}_lr"]
+            is_llm_optimizer = bool(opt_dict.get(f"{name}_is_llm_optimizer", False))
             optimizer_cls = get_optimizer_cls(opt_dict[f"{name}_cls"])
             opt_networks = opt_dict[f"{name}_networks"]
+            lr_value, lr_critic_value = _resolve_lr(self, lr)
             networks = [loaded_modules[net] for net in opt_networks]
-
             optimizer = OptimizerWrapper(
                 optimizer_cls=optimizer_cls,
                 networks=networks,
-                lr=getattr(self, lr),
+                lr=lr_value,
                 network_names=opt_networks,
                 lr_name=lr,
                 optimizer_kwargs=opt_kwargs,
+                lr_critic=lr_critic_value,
+                is_llm_optimizer=is_llm_optimizer,
             )
 
             state_dict = chkpt_attribute_to_device(
@@ -1504,26 +1530,57 @@ class MultiAgentRLAlgorithm(EvolvableAlgorithm, ABC):
     def preprocess_observation(
         self,
         observation: ObservationType,
+        group_ids: list[str] | None = None,
     ) -> dict[str, TorchObsType]:
         """Preprocesses observations for forward pass through neural network.
 
-        :param observations: Observations of environment
-        :type observations: numpy.ndarray[float] or dict[str, numpy.ndarray[float]]
+        :param observation: Observations of environment
+        :type observation: numpy.ndarray[float] or dict[str, numpy.ndarray[float]]
+        :param group_ids: Optional list of output IDs. When group IDs are provided
+            (e.g., ``["agent", "other_agent"]``), observations are grouped and
+            concatenated per group. Otherwise, observations are returned per
+            agent ID for backwards compatibility.
+        :type group_ids: list[str] | None
 
         :return: Preprocessed observations
         :rtype: torch.Tensor[float] or dict[str, torch.Tensor[float]] or tuple[torch.Tensor[float], ...]
         """
-        preprocessed = {}
+        if group_ids is None:
+            preprocessed = {}
+            for agent_id, agent_obs in observation.items():
+                preprocessed[agent_id] = preprocess_observation(
+                    self.possible_observation_spaces.get(agent_id),
+                    observation=agent_obs,
+                    device=self.device,
+                    normalize_images=self.normalize_images,
+                    placeholder_value=self.placeholder_value,
+                )
+            return preprocessed
+
+        preprocessed: dict[str, list[TorchObsType] | TorchObsType] = {
+            group_id: [] for group_id in group_ids
+        }
         for agent_id, agent_obs in observation.items():
-            preprocessed[agent_id] = preprocess_observation(
-                self.possible_observation_spaces.get(agent_id),
-                observation=agent_obs,
-                device=self.device,
-                normalize_images=self.normalize_images,
-                placeholder_value=self.placeholder_value,
+            output_id = self.get_network_id(agent_id)
+            if output_id not in preprocessed:
+                preprocessed[output_id] = []
+
+            preprocessed[output_id].append(
+                preprocess_observation(
+                    self.observation_space.get(output_id),
+                    observation=agent_obs,
+                    device=self.device,
+                    normalize_images=self.normalize_images,
+                    placeholder_value=self.placeholder_value,
+                )
             )
 
-        return preprocessed
+        for output_id in list(preprocessed.keys()):
+            if not preprocessed[output_id]:
+                continue
+            preprocessed[output_id] = concatenate_tensors(preprocessed[output_id])
+
+        return cast("dict[str, TorchObsType]", preprocessed)
 
     def extract_action_masks(self, infos: InfosDict) -> ArrayDict:
         """Extract action masks from info dictionary.
@@ -1773,6 +1830,16 @@ class MultiAgentRLAlgorithm(EvolvableAlgorithm, ABC):
         """
         return agent_id.rsplit("_", 1)[0] if isinstance(agent_id, str) else agent_id
 
+    def get_network_id(self, agent_id: str) -> str:
+        """Get the actor/critic network ID for an agent.
+
+        :param agent_id: The agent ID
+        :type agent_id: str
+        :return: The network ID
+        :rtype: str
+        """
+        return self.get_group_id(agent_id) if self.has_grouped_agents() else agent_id
+
     def assemble_shared_inputs(self, experience: ExperiencesType) -> ExperiencesType:
         """Preprocesses inputs by constructing dictionaries by shared agents.
 
@@ -1904,8 +1971,6 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
     :type max_grad_norm: float
     :param clone: Whether to clone the model.
     :type clone: bool
-    :param reduce_memory_peak: Whether to reduce memory peak.
-    :type reduce_memory_peak: bool
     :param calc_position_embeddings: Whether to calculate position embeddings.
     :type calc_position_embeddings: bool
     :param seed: The seed.
@@ -1914,12 +1979,16 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
     :type pad_token_id: int
     :param pad_token: The pad token.
     :type pad_token: str
-    :param use_liger_loss: Whether to use Liger loss.
+    :param use_liger_loss: Whether to use Liger loss. Defaults to ``False``.
+        Passing ``True`` without ``liger-kernel`` installed warns and falls
+        back to ``False``.
     :type use_liger_loss: bool
     :param lora_config: The LoRA config.
     :type lora_config: LoraConfigProtocol | None
     :param use_separate_reference_adapter: Whether to use a separate reference adapter.
     :type use_separate_reference_adapter: bool
+    :param use_value_head: Whether to use a separate value head.
+    :type use_value_head: bool
     :param model_name: The name of the model.
     :type model_name: str | None
     :param actor_network: The actor network.
@@ -1942,7 +2011,34 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
     :type model_config: dict[str, Any] | PretrainedConfig | None
     :param gradient_checkpointing: Whether to use gradient checkpointing.
     :type gradient_checkpointing: bool
+    :param torch_compiler: The torch compiler mode to use ('default',
+        'reduce-overhead', or 'max-autotune'), defaults to None.
+    :type torch_compiler: str | None, optional
+    :param reduce_memory_peak: Deprecated. Previously hinted peak-memory batching;
+        ignored. Configure ``micro_batch_size_per_gpu`` and DeepSpeed instead.
+    :type reduce_memory_peak: bool, optional
+    :param cast_logprobs_to_fp32: When ``True`` (the default), the per-token
+        log-probability reduction (``amax`` / ``gather`` / ``logsumexp``)
+        runs in fp32 before being cast back to the input dtype. Applies
+        uniformly to both the unfused ``(B, T, V)`` path
+        (:meth:`_logprobs_from_logits`) and the fused linear log-prob
+        path (:meth:`_logprobs_from_hidden_fused`) so the two paths
+        produce numerically equivalent log-probs.
+
+        The default preserves prior behaviour exactly: the unfused path
+        was already promoting to fp32 unconditionally before this flag
+        existed. The flag exposes that promotion as configurable.
+
+        Setting ``False`` introduces a per-token bf16 quantisation error
+        (~0.1 at ``V≈128k``) which can bias PPO/GRPO importance-sampling
+        ratios. Use only if you've verified bf16 is acceptable for your
+        vocab/shape — it saves ~18 GB on the unfused path at ``B=8,
+        T=2048, V≈152k``, ~6 MB on the fused path.
+    :type cast_logprobs_to_fp32: bool, optional
     """
+
+    _separate_reference_adapter_deprecation_emitted = False
+    _allowed_adapters = frozenset({"actor", "reference", "critic"})
 
     def __init__(
         self,
@@ -1951,96 +2047,64 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
         lr: float,
         max_grad_norm: float,
         clone: bool,
-        reduce_memory_peak: bool,
         calc_position_embeddings: bool,
         seed: int,
         pad_token_id: int,
         pad_token: str,
         use_liger_loss: bool,
-        lora_config: LoraConfigProtocol | None,
-        use_separate_reference_adapter: bool,
+        lora_config: LoraConfig | None,
+        use_separate_reference_adapter: bool = False,
+        lr_critic: float | None = None,
+        use_value_head: bool = False,
+        use_vllm: bool = False,
+        vllm_config: VLLMConfig | None = None,
         model_name: str | None = None,
         actor_network: PreTrainedModelProtocol | None = None,
         micro_batch_size_per_gpu: int | None = None,
         cosine_lr_schedule_config: CosineLRScheduleConfig | None = None,
         hp_config: HyperparameterConfig | None = None,
+        use_memory_efficient_params: bool = True,
         wrap: bool = True,
         device: str | torch.device = "cpu",
         accelerator: Accelerator | None = None,
         name: str | None = None,
         model_config: dict[str, Any] | PretrainedConfigProtocol | None = None,
         gradient_checkpointing: bool = True,
+        torch_compiler: str | None = None,
+        reduce_memory_peak: bool = False,
+        use_fused_linear_logprobs: bool = False,
+        cast_logprobs_to_fp32: bool = True,
     ) -> None:
         if not HAS_LLM_DEPENDENCIES:
             msg = "LLM dependencies are not installed. Please install them using `pip install agilerl[llm]`."
-            raise ImportError(
-                msg,
+            raise ImportError(msg)
+        if reduce_memory_peak:
+            warnings.warn(
+                "reduce_memory_peak is deprecated and has no effect; configure batch "
+                "size via micro_batch_size_per_gpu and DeepSpeed settings instead.",
+                DeprecationWarning,
+                stacklevel=2,
             )
+        if use_liger_loss and not HAS_LIGER_KERNEL:
+            warnings.warn(
+                "use_liger_loss=True requested, but `liger-kernel` is not available on this platform/environment. "
+                "Falling back to standard loss.",
+                stacklevel=2,
+            )
+            use_liger_loss = False
 
         if model_name is None and actor_network is None:
             msg = "At least one of model_name or actor_network must be provided."
             raise ValueError(
                 msg,
             )
-        if (
-            accelerator is not None
-            and cosine_lr_schedule_config is not None
-            and accelerator.is_main_process
-        ):
+
+        if lora_config is None:
             warnings.warn(
-                "Cannot specify the optimizer in the deepspeed config and use AgileRL's LR scheduler. If you want to use LR scheduling, \
-            please specify in the deepspeed config. Setting LR scheduler to None.",
-                stacklevel=2,
-            )
-            cosine_lr_schedule_config = None
-
-        super().__init__(index, hp_config, device, accelerator, None, name)
-        self.gradient_checkpointing = gradient_checkpointing
-        self.zero_stage = None
-        self.reference_update_tracker = 0  # Updated every time the reference policy is updated which is updated each time we pass through the train dataset
-        self.calc_position_embeddings = calc_position_embeddings
-        self.pad_token_id = pad_token_id
-        self.pad_token = pad_token
-        self.pretrained_model_name_or_path = (
-            model_name if model_name is not None else actor_network.name_or_path
-        )
-        self.model_config = model_config
-
-        if not clone and reduce_memory_peak and micro_batch_size_per_gpu is not None:
-            msg = "Cannot specify micro_batch_size_per_gpu when reduce_memory_peak is True."
-            raise ValueError(
-                msg,
-            )
-
-        self._configure_batch_size(
-            batch_size,
-            clone,
-            reduce_memory_peak,
-            micro_batch_size_per_gpu,
-        )
-        self.batch_size = self.batch_size_per_process * (
-            self.accelerator.num_processes if self.accelerator is not None else 1
-        )
-        if self.accelerator is not None and (
-            self.accelerator.state.deepspeed_plugin.deepspeed_config.get(
-                "optimizer",
-                None,
-            )
-            is not None
-        ):
-            optim_lr = self.accelerator.state.deepspeed_plugin.deepspeed_config[
-                "optimizer"
-            ]["params"]["lr"]
-            if optim_lr is not None and optim_lr != lr:
-                warnings.warn(
-                    "Argument 'lr' will be overwritten by the 'lr' value set in the deepspeed config.",
-                    stacklevel=2,
-                )
-                lr = optim_lr
-
-        if lora_config is None and not isinstance(actor_network, PeftModelProtocol):
-            warnings.warn(
-                "No LoRA config provided. AgileRL can only be used to finetune adapters at present. Using default LoRA configuration for RL finetuning.",
+                "No LoRA config provided. AgileRL can only be used to finetune adapters at present. "
+                "Using default LoRA configuration for RL finetuning: "
+                "r=16, lora_alpha=32, target_modules='all-linear', task_type='CAUSAL_LM', lora_dropout=0.05."
+                "To use a different LoRA configuration, please pass lora_config to the constructor.",
                 stacklevel=2,
             )
             lora_config = LoraConfig(
@@ -2056,49 +2120,123 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
                 stacklevel=2,
             )
             lora_config.exclude_modules = ["lm_head"]
-        self.lr = lr
-        self.lora_config = lora_config
-        self.wrap = wrap
-        self.use_separate_reference_adapter = use_separate_reference_adapter
-        self.cosine_lr_schedule_config = cosine_lr_schedule_config
 
-        if max_grad_norm and (accelerator is not None):
-            if accelerator.is_main_process:
-                warnings.warn(
-                    "Argument 'max_grad_norm' will overwrite the equivalent value set for 'gradient_clipping' in the deepspeed config.",
-                    stacklevel=2,
-                )
-            self.accelerator.state.deepspeed_plugin.deepspeed_config[
-                "gradient_clipping"
-            ] = max_grad_norm
+        if use_memory_efficient_params and use_vllm and not vllm_config.sleep_mode:
+            warnings.warn(
+                "Memory efficient params is only supported when using vLLM in sleep mode."
+                "Setting use_memory_efficient_params to False.",
+                stacklevel=2,
+            )
+            use_memory_efficient_params = False
 
-        self.max_grad_norm = max_grad_norm
-        self.reduce_memory_peak = reduce_memory_peak
+        if use_memory_efficient_params and not use_vllm:
+            warnings.warn(
+                "Memory efficient params is only supported when using vLLM."
+                "Setting use_memory_efficient_params to False.",
+                stacklevel=2,
+            )
+            use_memory_efficient_params = False
+
+        if vllm_config is not None and not use_vllm:
+            warnings.warn(
+                "vllm_config is provided but use_vllm is False. Setting vllm_config to None.",
+                stacklevel=2,
+            )
+            vllm_config = None
+
+        super().__init__(index, hp_config, device, accelerator, torch_compiler, name)
+        self.gradient_checkpointing = gradient_checkpointing
+        self.use_liger_loss = use_liger_loss
+        self.zero_stage = None
+        self.reference_update_tracker = 0  # Updated every time the reference policy is updated which is updated each time we pass through the train dataset
+        self.calc_position_embeddings = calc_position_embeddings
+        self.pad_token_id = pad_token_id
+        self.pad_token = pad_token
+        self.pretrained_model_name_or_path = (
+            model_name
+            if model_name is not None
+            else get_model_name_or_path(actor_network)
+        )
+        self.model_config = model_config
+        self._configure_batch_size_per_process(
+            batch_size,
+            micro_batch_size_per_gpu,
+        )
+        self.batch_size = batch_size
+        self.lr = align_deepspeed_lr(float(lr), self.accelerator)
+        self.lr_critic = lr_critic
 
         if self.accelerator is not None:
-            self.register_mutation_hook(self._sync_deepspeed_gradient_clipping)
-
-        if self.accelerator is not None:
-            self.zero_stage = self.accelerator.state.deepspeed_plugin.deepspeed_config[
-                "zero_optimization"
-            ]["stage"]
-            if (
-                self.zero_stage is not None
-                and self.zero_stage > 2
-                and self.accelerator.is_main_process
-            ):
-                warnings.warn(
-                    "DeepSpeed ZeRO Stage 3 is nascent and may not work as expected, proceed with caution when using this feature.",
-                    stacklevel=2,
-                )
-        if self.accelerator is not None:
-            if self.accelerator.is_main_process:
-                seed = np.random.randint(0, 2**31 - 1)
+            ds_plugin = getattr(self.accelerator.state, "deepspeed_plugin", None)
+            if ds_plugin is not None:
+                ds_config = ds_plugin.deepspeed_config
+                if max_grad_norm is not None:
+                    if accelerator.is_main_process:
+                        warnings.warn(
+                            "Argument 'max_grad_norm' will overwrite the equivalent value set for 'gradient_clipping' in the deepspeed config.",
+                            stacklevel=2,
+                        )
+                    ds_config["gradient_clipping"] = max_grad_norm
+                if (
+                    cosine_lr_schedule_config is not None
+                    and accelerator.is_main_process
+                ):
+                    warnings.warn(
+                        "Cannot specify the optimizer in the DeepSpeed config and use AgileRL's LR scheduler. "
+                        "If you want to use LR scheduling, please specify in the DeepSpeed config. "
+                        "Setting LR scheduler to None.",
+                        stacklevel=2,
+                    )
+                    cosine_lr_schedule_config = None
+                self.register_mutation_hook(self._sync_deepspeed_gradient_clipping)
+                self.zero_stage = ds_config["zero_optimization"]["stage"]
+                if (
+                    self.zero_stage is not None
+                    and self.zero_stage > 2
+                    and self.accelerator.is_main_process
+                ):
+                    warnings.warn(
+                        "DeepSpeed ZeRO Stage 3 is nascent and may not work as expected, proceed with caution when using this feature.",
+                        stacklevel=2,
+                    )
             if self.accelerator.num_processes > 1:
                 seed = broadcast_object_list([seed], from_process=0)[0]
+            seed += self.accelerator.process_index
+            set_seed(seed)
+
+        # YAML / config loaders may supply LR as a string (e.g. "5e-5"); PyTorch optimizers require float.
+        self.lora_config = lora_config
+        self.use_vllm = use_vllm
+        self.vllm_config = vllm_config
+        self.max_grad_norm = max_grad_norm
+        self.use_memory_efficient_params = use_memory_efficient_params
+        self.memory_efficient_params_context = (
+            self._memory_efficient_params
+            if use_memory_efficient_params
+            else nullcontext
+        )
+        self.wrap = wrap
+        self.use_separate_reference_adapter = use_separate_reference_adapter
+        self._warn_separate_reference_adapter_deprecation()
+        self.use_fused_linear_logprobs = use_fused_linear_logprobs
+        self.cast_logprobs_to_fp32 = cast_logprobs_to_fp32
+
+        selected_adapters = ("actor",)
+        if use_separate_reference_adapter:
+            selected_adapters += ("reference",)
+        if use_value_head:
+            selected_adapters += ("critic",)
+        self.selected_adapters = selected_adapters
+
+        self.cosine_lr_schedule_config = cosine_lr_schedule_config
+        self.use_value_head = use_value_head
+        self._uses_deepspeed = (
+            self.accelerator is not None
+            and getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
+        )
+        self._vllm_awake = self.use_vllm and not self.vllm_config.sleep_mode
+        self._vllm_moved = False
         self.rng = np.random.RandomState(seed)
-        if self.accelerator is not None:
-            set_seed(seed, device_specific=True)
 
     def preprocess_observation(self, observation: ObservationType) -> TorchObsType:
         """Preprocess observations (dummy) for forward pass through neural network.
@@ -2111,86 +2249,417 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
         """
         return cast("TorchObsType", observation)
 
-    def save_checkpoint(self, path: str, weights_only: bool = True) -> None:
-        """Override the save_checkpoint method to provide guidance on the correct method to use.
-        :param path: Location to save checkpoint at
-        :type path: string
-        :param weights_only: If True, only save the weights of the model, defaults to False
-        :type weights_only: bool, optional.
-        """
-        if self.accelerator is not None:
-            if not weights_only:
-                self._save_distributed_actor(path, tag="save_checkpoint")
-            else:
-                selected_adapters = (
-                    ["actor", "reference"]
-                    if self.use_separate_reference_adapter
-                    else ["actor"]
-                )
-                model_ref = self.accelerator.unwrap_model(self.actor)
-                with gather_if_zero3(self.zero_stage, list(model_ref.parameters())):
-                    model_ref.save_pretrained(
-                        save_directory=path,
-                        selected_adapters=selected_adapters,
-                        is_main_process=self.accelerator.is_main_process,
-                    )
+    def _warn_separate_reference_adapter_deprecation(self) -> None:
+        """Warn once per process about the pending adapter-mode deprecation."""
+        if not self.use_separate_reference_adapter:
+            return
+        if LLMAlgorithm._separate_reference_adapter_deprecation_emitted:
+            return
+        warnings.warn(
+            "`use_separate_reference_adapter=True` is deprecated and will be "
+            "removed in a future release. Prefer using LoRA adapters while "
+            "keeping the base model untouched.",
+            category=DeprecationWarning,
+            stacklevel=2,
+        )
+        LLMAlgorithm._separate_reference_adapter_deprecation_emitted = True
 
+    def save_checkpoint(
+        self,
+        path: str,
+        lora_only: bool = True,
+        save_optimizer: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        """Save adapter weights and algorithm state to a directory.
+
+        AgileRL never persists base-model weights when ``lora_only=True`` for
+        LLM algorithms: a checkpoint is a directory containing
+
+          * ``<adapter>/adapter_model.safetensors`` + ``adapter_config.json`` —
+            one subdirectory per adapter in :attr:`selected_adapters` (always
+            ``actor``, plus ``reference`` / ``critic`` when those adapters are
+            configured). Written only when ``lora_only=True``.
+          * ``attributes.pt`` — algorithm hyperparameters, plus (optionally)
+            the actor state dict and/or optimizer state dict depending on the
+            cell below. Always present.
+          * ``save_checkpoint/`` — DeepSpeed ZeRO \u2265 2 sharded-checkpoint
+            output. Present only when an :class:`~accelerate.Accelerator` is
+            attached and ``save_optimizer=True``.
+
+        Behaviour per cell of the ``(lora_only, save_optimizer, deepspeed)``
+        grid:
+
+          Plain (no accelerator):
+            lora_only=T, save_optimizer=T  ->  PEFT adapter dirs on disk +
+                                                 optimizer state in ``attributes.pt``
+            lora_only=T, save_optimizer=F  ->  PEFT adapter dirs only
+            lora_only=F, save_optimizer=T  ->  full actor state_dict +
+                                                 optimizer state in ``attributes.pt``
+            lora_only=F, save_optimizer=F  ->  full actor state_dict in ``attributes.pt``
+
+          DeepSpeed:
+            lora_only=T, save_optimizer=T  ->  engine tag dir (frozen params
+                                                 excluded) + PEFT adapter dirs
+            lora_only=T, save_optimizer=F  ->  PEFT adapter dirs only
+            lora_only=F, save_optimizer=T  ->  engine tag dir (frozen params
+                                                 included)
+            lora_only=F, save_optimizer=F  ->  gathered (ZeRO-3 aware) actor
+                                                 state_dict injected into
+                                                 ``attributes.pt``
+
+        :param path: Directory to write the checkpoint into.
+        :type path: str
+        :param lora_only: If ``True`` (default) only adapter weights are
+            written to disk via ``save_pretrained``; the base model is shared
+            across checkpoints and not serialised. If ``False``, the full
+            actor state dict is persisted (into ``attributes.pt`` on the plain
+            path, or into the DeepSpeed engine's tag dir / gathered dict on
+            the distributed path).
+        :type lora_only: bool
+        :param save_optimizer: If ``True`` (default) also persist the
+            optimizer and LR scheduler state so training can resume. On
+            DeepSpeed ZeRO \u2265 2 this writes a sharded checkpoint into
+            ``<path>/save_checkpoint``; otherwise optimizer state is included
+            in ``attributes.pt``.
+        :type save_optimizer: bool
+        """
+        if "weights_only" in kwargs:
+            warnings.warn(
+                "weights_only is deprecated and will be removed in a future release. Use lora_only instead.",
+                stacklevel=2,
+                category=DeprecationWarning,
+            )
+            lora_only = kwargs["weights_only"]
+        if lora_only and not self.use_separate_reference_adapter:
+            warnings.warn(
+                "lora_only=True requested, but use_separate_reference_adapter is False; base model (reference) weights will not be saved.",
+                stacklevel=2,
+                category=UserWarning,
+            )
+
+        Path(path).mkdir(parents=True, exist_ok=True)
+
+        # omit_actor_info: actor state goes into attributes.pt only when we
+        # want a full-model torch save on the plain (non-deepspeed) path.
+        #   * lora_only=True  → adapter weights saved via PEFT on disk; no actor in attrs.pt.
+        #   * deepspeed        → actor state either lives in the engine's tag dir
+        #                        (save_optimizer=True) or is gathered and injected
+        #                        via the manual state_dict path below (F, F).
+        #   * plain + lora_only=False → full state_dict round-trips through attrs.pt.
+        omit_actor_info = lora_only or self.accelerator is not None
+        omit_optimizer_info = True
+        state_dict = {}
+        if save_optimizer:
+            if self.accelerator is not None:
+                # Save deepspeed checkpoint with lora_only=True
+                self._save_distributed_actor(
+                    path, tag="save_checkpoint", lora_only=lora_only
+                )
+            else:
+                omit_optimizer_info = False
+
+        if lora_only:
+            model_ref = self._get_unwrapped_actor()
+            with gather_if_zero3(self.zero_stage, list(model_ref.parameters())):
+                model_ref.save_pretrained(
+                    save_directory=path,
+                    selected_adapters=self.selected_adapters,
+                    is_main_process=self.accelerator is None
+                    or self.accelerator.is_main_process,
+                )
+
+        elif self._uses_deepspeed and not save_optimizer:
+            # (lora_only=False, save_optimizer=False, deepspeed): the ZeRO-3
+            # shards aren't materialised in the default module loop, so gather
+            # manually and inject the state_dict into attributes.pt.
+            model_ref = self._get_unwrapped_actor()
+            with gather_if_zero3(self.zero_stage, list(model_ref.parameters())):
+                module_cls = model_ref.__class__
+                state_dict = {
+                    "actor_cls": module_cls,
+                    "actor_init_dict": None,
+                    "actor_state_dict": model_ref.state_dict(),
+                    "actor_module_dict_cls": None,
+                }
+
+        # Build the checkpoint payload saved alongside adapter weights.
         checkpoint_dict = get_checkpoint_dict(
             self,
-            using_deepspeed=self.accelerator is not None,
+            omit_actor_info=omit_actor_info,
+            omit_optimizer_info=omit_optimizer_info,
         )
-        checkpoint_dict["_weights_only"] = weights_only
         checkpoint_dict.pop("llm", None)
         checkpoint_dict.pop("tp_group", None)
+        checkpoint_dict["_lora_only"] = lora_only
+        if state_dict:
+            checkpoint_dict["network_info"] = {}
+            checkpoint_dict["network_info"]["modules"] = {}
+            checkpoint_dict["network_info"]["modules"] = state_dict
 
+        # Persist non-model attributes to ``attributes.pt``.
+        # In distributed runs only the main process writes the file.
         if self.accelerator is None or self.accelerator.is_main_process:
+            checkpoint_path = Path(path) / "attributes.pt"
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
             torch.save(
                 checkpoint_dict,
-                path + "/attributes.pt",
+                str(checkpoint_path),
                 pickle_module=dill,
             )
+
         if self.accelerator is not None:
             self.accelerator.wait_for_everyone()
 
-    def load_checkpoint(self, path: str) -> None:
-        """Override the load_checkpoint method to provide guidance on the correct method to use.
+    def load_checkpoint(
+        self,
+        path: str,
+        load_optimizer: bool = False,
+        overwrite_reference_adapter: bool = False,
+        overwrite_critic_adapter: bool = True,
+        merge_lora_configs: bool = False,
+    ) -> None:
+        """Load adapter weights and algorithm state from a checkpoint directory.
 
-        :param path: Location to load checkpoint from
-        :type path: string
+        Adapter roles restored on load:
+
+          * ``actor``     — the trained policy. Always loaded.
+          * ``reference`` — the fixed policy used for KL / comparison. The
+            checkpoint's ``actor`` adapter is copied onto ``reference`` so
+            that SFT -> DPO -> GRPO chains work out of the box: the stage-N
+            actor becomes the stage-N+1 reference.
+          * ``critic``    — optional value head. Loaded from disk if a
+            ``critic/`` adapter is present, else copied from ``actor``, else
+            left as the live fresh LoRA init.
+
+        LoRA config reconciliation: when the checkpoint's config and the live
+        algorithm's config disagree, loading fails fast by default. Pass
+        ``merge_lora_configs=True`` to merge them for compatibility:
+
+          * ``r`` (rank) -> ``max(current, checkpoint)``; the smaller side's
+            weights are padded into the top-left rank slice of the larger
+            adapter (see :meth:`_pad_adapter_state_to_live_shape`).
+          * ``target_modules`` / ``modules_to_save`` -> union.
+          * Any other mismatched field -> current value wins, with a warning.
+
+        Any adapter whose live config ends up differing from the selected
+        target config is rebuilt via :meth:`_reconfigure_adapters_to_match` before
+        weights are loaded, so tensors always land in the correct shape.
+
+          No DeepSpeed:
+            lora_only=T, load_optimizer=T  ->  PEFT adapter load + optimizer
+                                                 state from ``attributes.pt``
+            lora_only=T, load_optimizer=F  ->  PEFT adapter load only
+            lora_only=F, load_optimizer=T  ->  torch load of actor +
+                                                 optimizer from ``attributes.pt``
+            lora_only=F, load_optimizer=F  ->  torch load of actor only
+
+          DeepSpeed:
+            lora_only=T, load_optimizer=T  ->  DeepSpeed engine load from
+                                                 ``<path>/save_checkpoint``
+            lora_only=T, load_optimizer=F  ->  PEFT adapter load
+            lora_only=F, load_optimizer=T  ->  DeepSpeed engine load from
+                                                 ``<path>/save_checkpoint``
+            lora_only=F, load_optimizer=F  ->  ``actor.load_state_dict(...)``
+                                                 from ``attributes.pt``
+
+        When ``load_optimizer=True`` but the checkpoint contains no optimizer
+        state (e.g. it was saved with ``save_optimizer=False``), a
+        ``UserWarning`` is emitted and a freshly-initialised optimizer is
+        used.
+
+        :param path: Directory containing a checkpoint written by
+            :meth:`save_checkpoint`.
+        :type path: str
+        :param load_optimizer: If ``True`` (default) also load the optimizer
+            and LR scheduler state so training can resume. On DeepSpeed ZeRO
+            \u2265 2 this reads a sharded checkpoint from
+            ``<path>/save_checkpoint``; otherwise optimizer state is read
+            from ``attributes.pt``.
+        :type load_optimizer: bool
+        :param merge_lora_configs: If ``True``, allow loading checkpoints whose
+            LoRA config differs from the live agent by reconciling them.
+            If ``False`` (default), mismatched LoRA configs raise ``ValueError``.
+        :type merge_lora_configs: bool
         """
-        if self.accelerator is not None:
-            checkpoint = torch.load(path + "/attributes.pt", weights_only=False)
-            weights_only = checkpoint.get("_weights_only", False)
+        pickle_module = dill if self.accelerator is None else pickle
+        checkpoint = torch.load(
+            str(Path(path) / "attributes.pt"),
+            weights_only=False,
+            pickle_module=pickle_module,
+        )
 
-            if weights_only:
-                if self.use_separate_reference_adapter:
-                    self._update_existing_adapter(
+        lora_only = checkpoint.pop("_lora_only", False) or checkpoint.pop(
+            "_weights_only", False
+        )
+        if self._uses_deepspeed:
+            if load_optimizer:
+                self._load_distributed_actor(path, tag="save_checkpoint")
+                # DeepSpeed restore resumes actor/optimizer shards. For LoRA-only
+                # checkpoints also load adapter dirs so reference/critic adapters
+                # are refreshed from PEFT artifacts.
+                if lora_only:
+                    self._load_model_checkpoint(
                         path,
-                        "reference",
+                        overwrite_reference_adapter,
+                        overwrite_critic_adapter,
+                        merge_lora_configs,
                     )
-
-                self._update_existing_adapter(
+            elif lora_only:
+                self._load_model_checkpoint(
                     path,
-                    "actor",
+                    overwrite_reference_adapter,
+                    overwrite_critic_adapter,
+                    merge_lora_configs,
                 )
             else:
-                self._load_distributed_actor(path, tag="save_checkpoint")
+                actor_state_dict = (
+                    checkpoint.get("network_info", {})
+                    .get("modules", {})
+                    .get("actor_state_dict")
+                )
+                if actor_state_dict is None:
+                    # DeepSpeed full-model checkpoints saved with
+                    # save_optimizer=True persist module weights in the
+                    # save_checkpoint tag directory (not attributes.pt).
+                    self._load_distributed_actor(
+                        path,
+                        tag="save_checkpoint",
+                        load_optimizer_states=False,
+                        load_lr_scheduler_states=False,
+                    )
+                else:
+                    model_ref = self._get_unwrapped_actor()
+                    with gather_if_zero3(self.zero_stage, list(model_ref.parameters())):
+                        model_ref.load_state_dict(actor_state_dict)
 
-            for attr, value in checkpoint.items():
-                setattr(self, attr, value)
+            self._restore_checkpoint_attributes(checkpoint)
 
-            self.device = self.accelerator.device
-
-            self.optimizer = None
-            self.optimizer = OptimizerWrapper(
-                optimizer_cls=self._select_optim_class(),
-                networks=[self.actor],
-                network_names=["actor"],
-                lr=self.lr,
-                lr_name="lr",
-            )
         else:
+            # ``get_checkpoint_dict`` always emits a ``network_info.optimizers``
+            # key — empty dict means "no optimizer state was saved". Check
+            # truthiness, not key presence.
+            if (
+                not checkpoint.get("network_info", {}).get("optimizers")
+                and load_optimizer
+            ):
+                warnings.warn(
+                    "Optimizer state not found in checkpoint. Training will proceed using a NEW optimizer instance with random/initial default state. ",
+                    stacklevel=2,
+                )
+            # Load checkpoint before super() so that we can merge the LoRA configs if they are mismatched
+            if lora_only:
+                self._load_model_checkpoint(
+                    path,
+                    overwrite_reference_adapter,
+                    overwrite_critic_adapter,
+                    merge_lora_configs,
+                )
+            # ``super().load_checkpoint`` restores every attribute from the
+            # checkpoint, which would clobber the just-merged ``lora_config`` /
+            # ``selected_adapters``. Stash and restore, mirroring the deepspeed
+            # branch's ``_restore_checkpoint_attributes`` skip-list.
+            live_lora_config = self.lora_config
+            live_selected_adapters = self.selected_adapters
             super().load_checkpoint(path + "/attributes.pt")
+            self.lora_config = live_lora_config
+            self.selected_adapters = live_selected_adapters
+
+        if "lr_scheduler" in checkpoint and self.lr_scheduler is not None:
+            self.lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+
+    def _load_model_checkpoint(
+        self,
+        path: str,
+        overwrite_reference_adapter: bool = False,
+        overwrite_critic_adapter: bool = True,
+        merge_lora_configs: bool = False,
+    ) -> None:
+        """Restore LoRA adapter weights from a checkpoint directory.
+
+        Reconciles any LoRA config mismatch (e.g. rank mutation) between the checkpoint
+        and the live algorithm before loading weights. By default mismatches raise
+        ``ValueError``; pass ``merge_lora_configs=True`` to use
+        :meth:`_merge_lora_configs` compatibility behavior. Reference and Critic
+        LoRA adapters in the checkpoint can be overwritten by the Actor using the
+        ``overwrite_reference_adapter`` and ``overwrite_critic_adapter`` flags.
+
+        :param path: Checkpoint directory path.
+        :type path: str
+        :param overwrite_reference_adapter: If ``True`` do not overwrite the live reference
+            adapter. Defaults to ``False``.
+        :type overwrite_reference_adapter: bool
+        :param merge_lora_configs: Whether to merge mismatched LoRA configs instead
+            of failing fast.
+        :type merge_lora_configs: bool
+        """
+        ckpt_lora_config = self._load_checkpoint_lora_config(path)
+        if ckpt_lora_config is not None:
+            if self.lora_config is None:
+                self.lora_config = ckpt_lora_config
+            elif self._lora_configs_equivalent(self.lora_config, ckpt_lora_config):
+                self.lora_config = ckpt_lora_config
+            elif merge_lora_configs:
+                self.lora_config = self._merge_lora_configs(
+                    self.lora_config, ckpt_lora_config
+                )
+            else:
+                raise ValueError(
+                    self._format_lora_config_mismatch_error(
+                        self.lora_config, ckpt_lora_config
+                    )
+                )
+            self._reconfigure_adapters_to_match(self.lora_config)
+
+        for adapter in self.selected_adapters:
+            if (Path(path) / adapter).exists():
+                # ``_load_adapter_weights`` itself invokes
+                # ``_pad_adapter_state_to_live_shape`` internally when ranks
+                # differ — no need to call it again out here.
+                self._load_adapter_weights(path, adapter, ckpt_lora_config)
+
+        if "reference" in self.selected_adapters and overwrite_reference_adapter:
+            self._copy_adapter_weights(
+                source_adapter="actor", target_adapter="reference"
+            )
+
+        if "critic" in self.selected_adapters and overwrite_critic_adapter:
+            # Always overwrite the critic
+            self._copy_adapter_weights(source_adapter="actor", target_adapter="critic")
+
+    def _restore_checkpoint_attributes(self, checkpoint: dict[str, Any]) -> None:
+        """Restore algorithm attributes from payload.
+
+        ``lora_config`` and ``selected_adapters`` are intentionally skipped \u2014 the current
+        algorithm's values are authoritative, and any LoRA-shape reconciliation is done
+        inside :meth:`_load_model_checkpoint`.
+
+        :param checkpoint: Loaded attribute payload.
+        :type checkpoint: dict[str, Any]
+        :param checkpoint_type: The checkpoint type.
+        :type checkpoint_type: Literal["peft", "deepspeed", "torch"]
+        """
+        skip_attrs = {"lr_scheduler", "lora_config", "selected_adapters"}
+        for attr, value in checkpoint.items():
+            if attr in skip_attrs:
+                continue
+            setattr(self, attr, value)
+
+    def _rebuild_optimizer_after_load(self) -> None:
+        """Recreate the optimizer wrapper after distributed checkpoint load.
+
+        Distributed load restores model weights/engine state first, then this
+        method rebuilds the wrapper metadata used by training paths.
+        """
+        self.optimizer = OptimizerWrapper(
+            optimizer_cls=self._select_optim_class(),
+            networks=[self.actor],
+            network_names=["actor"],
+            lr=self.lr,
+            lr_critic=self.lr_critic,
+            is_llm_optimizer=True,
+            lr_name="lr" if self.lr_critic is None else ("lr_actor", "lr_critic"),
+        )
 
     @classmethod
     def load(
@@ -2201,7 +2670,7 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
     ) -> None:
         msg = (
             "The load class method is not supported for this algorithm class. "
-            "To load a saved LLM, please load the model as follows, and then re-instantiate the GRPO "
+            "To load a saved LLM, please load the model as follows, and then re-instantiate the GRPO/DPO/SFT "
             "class, using the pre-trained model.\n\n"
             "base_model = AutoModelForCausalLM.from_pretrained(\n"
             '    "Qwen/Qwen2.5-3B",\n'
@@ -2209,94 +2678,12 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
             '    device_map="auto"\n'
             ")\n"
             'tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-3B")\n'
-            "model = PeftModelProtocol.from_pretrained(base_model, path)"
+            "model = PeftModelProtocol.from_pretrained(base_model, path)\n"
+            "where 'path' is the directory containing the saved LoRA adapter weights."
         )
         raise NotImplementedError(
             msg,
         )
-
-    def _select_optim_class(self) -> type[OptimizerType] | type[DummyOptimizer]:
-        """Select the optimizer class based on the accelerator and deepspeed config.
-
-        :return: Optimizer class
-        :rtype: type[torch.optim.Optimizer] | type[DummyOptimizer]
-        """
-        if self.accelerator is None:
-            return AdamW
-        if (
-            self.accelerator.state.deepspeed_plugin is not None
-            and self.accelerator.state.deepspeed_plugin.deepspeed_config.get(
-                "optimizer",
-                None,
-            )
-            is not None
-        ):
-            return DummyOptimizer
-        return AdamW
-
-    def _save_distributed_actor(
-        self,
-        path: str,
-        tag: str = "intermediate_checkpoint",
-    ) -> None:
-        """Override the save_checkpoint method to provide guidance on the correct method to use.
-
-        :param path: Output directory to save the checkpoint at
-        :type path: str
-        """
-        if self.accelerator is not None:
-            Path(path).mkdir(parents=True, exist_ok=True)
-            assert self.actor is not None, (
-                "Actor is not defined, please check that the actor is defined."
-            )
-            self.actor.save_checkpoint(path, tag=tag)
-            self.actor.set_adapter("actor")
-        else:
-            warnings.warn(
-                "Distributed actor save not supported for non-distributed training.",
-                stacklevel=2,
-            )
-
-    def _load_distributed_actor(
-        self,
-        path: str,
-        tag: str = "intermediate_checkpoint",
-    ) -> None:
-        """Override the load_checkpoint method to provide guidance on the correct method to use.
-
-        :param path: Output directory to load the checkpoint from
-        :type path: str
-        """
-        if self.accelerator is not None:
-            deepspeed_dirs = sorted(Path(path).glob(tag))
-            try:
-                assert len(deepspeed_dirs) > 0
-                load_path, _ = self.actor.load_checkpoint(
-                    str(path),
-                    tag=tag,
-                    load_module_strict=False,
-                    load_optimizer_states=True,
-                    load_lr_scheduler_states=True,
-                )
-                if load_path is None:
-                    msg = (
-                        "Load path is returned as None from deepspeed load_checkpoint."
-                    )
-                    raise ValueError(
-                        msg,
-                    )
-                self.actor.set_adapter("actor")
-
-            except Exception as e:
-                msg = f"Deepspeed failed to resume from checkpoint {path}"
-                raise ValueError(
-                    msg,
-                ) from e
-        else:
-            warnings.warn(
-                "Distributed actor load not supported for non-distributed training.",
-                stacklevel=2,
-            )
 
     def wrap_models(self) -> None:
         """Wrap the models in the accelerator, DeepSpeed objects must be wrapped at the same time,
@@ -2306,22 +2693,32 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
             assert self.optimizer is not None, (
                 "Optimizer is set to None, please check that the optimizer is correctly defined."
             )
+            # The below is true when an optimizer is defined in the deepspeed config.
             is_dummy_optimizer = isinstance(self.optimizer.optimizer, DummyOptimizer)
+            self._restore_adapter_trainability(["actor", "critic"])
+
+            # When prepare is called on the dummy optimizer, it is returned as a DummyOptimizer object.
+            # In the cases where self.optimizer.optimizer is an optim.Adam object, it is returned as DeepSpeedOptimizer
             self.actor, optimizer, self.lr_scheduler = self.accelerator.prepare(
                 self.actor,
                 self.optimizer.optimizer,
                 self.lr_scheduler,
             )
+            # If optimizer is a dummy optimizer, then the deepspeed engine has been initialized with
+            # an optimizer in the config and the optimizer is therefore part of the engine. We point the
+            # optimizer attribute of the OptimizerWrapper to the active optimizer.
             self.optimizer.optimizer = (
                 optimizer if not is_dummy_optimizer else self.actor.optimizer
             )
+
+            # Again, we retrospectively set the optimizer class to the type of the optimizer as returned by prepare.
             self.optimizer.optimizer_cls = (
                 type(optimizer)
                 if not is_dummy_optimizer
                 else type(self.actor.optimizer)
             )
             if self.gradient_checkpointing:
-                self.actor.module.gradient_checkpointing_enable(
+                self._get_unwrapped_actor().gradient_checkpointing_enable(
                     gradient_checkpointing_kwargs={"use_reentrant": False},
                 )
         else:
@@ -2330,7 +2727,9 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
             )
             self.actor = self.actor.to(self.device)
             if self.gradient_checkpointing:
-                self.actor.gradient_checkpointing_enable()
+                self.actor.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False},
+                )
 
     def clean_up(self) -> None:
         """Clean up the algorithm."""
@@ -2361,13 +2760,15 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
                 None,
             )
         if hasattr(self, "llm") and self.llm is not None:
-            del self.llm.llm_engine.model_executor
             del self.llm
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             if torch.cuda.is_initialized():
                 torch.cuda.synchronize()
+        elif torch.mps.is_available():
+            torch.mps.empty_cache()
+            torch.mps.synchronize()
 
     def clone(self, index: int | None = None, wrap: bool = True) -> Self:
         """Create a clone of the algorithm.
@@ -2381,101 +2782,157 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
         :rtype: EvolvableAlgorithm
         """
         with tempfile.TemporaryDirectory() as temp_dir:
-            # We need to use the same temp_dir for all processes, so we broadcast the temp_dir from the main process
-            if self.accelerator is not None and self.accelerator.num_processes > 1:
-                work_dir = broadcast_object_list([temp_dir], from_process=0)[0]
-            else:
-                work_dir = temp_dir
-
-            if (
-                self.accelerator is not None
-                and self.zero_stage is not None
-                and self.zero_stage >= 2
-            ):
-                self.accelerator.wait_for_everyone()
-                self._save_distributed_actor(f"{work_dir}/agent_{self.index}")
-                self.accelerator.wait_for_everyone()
-
-            input_args = EvolvableAlgorithm.inspect_attributes(
-                self,
-                input_args_only=True,
-            )
-            input_args["wrap"] = False
-            input_args["clone"] = True
-
-            actor: PeftModelProtocol = cast(
-                "PeftModelProtocol",
-                (
-                    self.accelerator.unwrap_model(self.actor)
-                    if self.accelerator is not None
-                    else self.actor
-                ),
-            )
-
-            actor_state_dict = None
-            if self.zero_stage is None or self.zero_stage < 2:
-                actor_state_dict = clone_tensors_for_torch_save(actor.state_dict())
-
-            cloned_model = clone_llm(
-                actor,
-                self.zero_stage,
-                state_dict=actor_state_dict,
-            )
-            input_args["actor_network"] = cloned_model
-            input_args["accelerator"] = (
-                Accelerator() if self.accelerator is not None else None
-            )
-
-            clone = type(self)(**input_args)
+            work_dir = self._resolve_clone_work_dir(temp_dir)
+            self._save_clone_distributed_actor_state(work_dir)
+            clone = self._create_clone_instance()
             clone.mutation_hook()
-
-            # Clone attributes
-            accelerator = clone.accelerator
-            cloned_lr_scheduler = clone.lr_scheduler
-            original_lr_scheduler = self.lr_scheduler
-            original_llm = None
-            cloned_llm = None
-            clone.lr_scheduler = None
-            self.lr_scheduler = None
-            if self.use_vllm:
-                original_llm = self.llm
-                cloned_llm = clone.llm
-                clone.llm = None
-                self.llm = None
-            clone = EvolvableAlgorithm.copy_attributes(self, clone)
-            clone.accelerator = accelerator
-            clone.lr_scheduler = cloned_lr_scheduler
-            self.lr_scheduler = original_lr_scheduler
-            if self.use_vllm:
-                clone.llm = cloned_llm
-                self.llm = original_llm
-
-            if self.accelerator is None:
-                clone.optimizer.optimizer.load_state_dict(
-                    state_dict=self.optimizer.optimizer.state_dict(),
-                )
-                if self.lr_scheduler is not None:
-                    clone.lr_scheduler.load_state_dict(self.lr_scheduler.state_dict())
+            clone = self._copy_clone_attributes(clone)
+            self._restore_clone_optimizer_and_scheduler(clone)
 
             # Set the index
             if index is not None:
                 clone.index = index
 
             clone.wrap_models()
-
-            if self.zero_stage is not None and self.zero_stage >= 2:
-                clone.accelerator.wait_for_everyone()
-                clone._load_distributed_actor(f"{work_dir}/agent_{self.index}")
-                clone.accelerator.wait_for_everyone()
-            elif self.accelerator is not None:
-                self.accelerator.wait_for_everyone()
+            self._load_clone_distributed_actor_state(clone, work_dir)
 
             return clone
+
+    def _resolve_clone_work_dir(self, temp_dir: str) -> str:
+        """Resolve a clone workspace path visible to all ranks.
+
+        :param temp_dir: Local temporary directory path.
+        :type temp_dir: str
+        :return: Shared working directory path for clone artifacts.
+        :rtype: str
+        """
+        if self.accelerator is not None and self.accelerator.num_processes > 1:
+            return broadcast_object_list([temp_dir], from_process=0)[0]
+        return temp_dir
+
+    def _save_clone_distributed_actor_state(self, work_dir: str) -> None:
+        """Save distributed actor state for ZeRO-2/3 clone workflows.
+
+        :param work_dir: Shared clone workspace directory.
+        :type work_dir: str
+        """
+        if self.accelerator is None or self.zero_stage is None or self.zero_stage < 2:
+            return
+
+        self.accelerator.wait_for_everyone()
+        self._save_distributed_actor(f"{work_dir}/agent_{self.index}")
+        self.accelerator.wait_for_everyone()
+
+    def _create_clone_instance(self) -> Self:
+        """Instantiate a clone with cloned actor weights and runtime args.
+
+        :return: Newly constructed clone instance.
+        :rtype: Self
+        """
+        input_args = EvolvableAlgorithm.inspect_attributes(
+            self,
+            input_args_only=True,
+        )
+        input_args["wrap"] = False
+        input_args["clone"] = True
+        input_args["actor_network"] = self._clone_actor_network()
+        input_args["accelerator"] = (
+            Accelerator() if self.accelerator is not None else None
+        )
+        return type(self)(**input_args)
+
+    def _clone_actor_network(self) -> PreTrainedModelProtocol:
+        """Clone actor network while preserving value-head state when enabled.
+
+        :return: Cloned actor network suitable for clone instantiation.
+        :rtype: PreTrainedModelProtocol
+        """
+        actor = self._get_unwrapped_actor()
+
+        if self.use_value_head:
+            value_head_model = actor
+            inner_peft = value_head_model.pretrained_model
+            inner_sd = None
+            if self.zero_stage is None or self.zero_stage < 2:
+                inner_sd = clone_tensors_for_torch_save(inner_peft.state_dict())
+            cloned_inner = clone_llm(inner_peft, self.zero_stage, state_dict=inner_sd)
+            cloned_model = type(value_head_model)(cloned_inner)
+            cloned_model.v_head.load_state_dict(value_head_model.v_head.state_dict())
+            cloned_model.is_peft_model = True
+            return cloned_model
+
+        actor_state_dict = None
+        if self.zero_stage is None or self.zero_stage < 2:
+            actor_state_dict = clone_tensors_for_torch_save(actor.state_dict())
+        return clone_llm(actor, self.zero_stage, state_dict=actor_state_dict)
+
+    def _copy_clone_attributes(self, clone: Self) -> Self:
+        """Copy non-network attributes while preserving clone runtime members.
+
+        Keeps clone-owned accelerator/scheduler (and vLLM handles when used)
+        intact while copying remaining algorithm attributes.
+
+        :param clone: Clone instance to mutate.
+        :type clone: Self
+        :return: Updated clone instance.
+        :rtype: Self
+        """
+        accelerator = clone.accelerator
+        cloned_lr_scheduler = clone.lr_scheduler
+        original_lr_scheduler = self.lr_scheduler
+
+        clone.lr_scheduler = None
+        self.lr_scheduler = None
+        if self.use_vllm:
+            original_llm = self.llm
+            cloned_llm = clone.llm
+            clone.llm = None
+            self.llm = None
+
+        clone = EvolvableAlgorithm.copy_attributes(self, clone)
+        clone.accelerator = accelerator
+        clone.lr_scheduler = cloned_lr_scheduler
+        self.lr_scheduler = original_lr_scheduler
+
+        if self.use_vllm:
+            clone.llm = cloned_llm
+            self.llm = original_llm
+        return clone
+
+    def _restore_clone_optimizer_and_scheduler(self, clone: Self) -> None:
+        """Restore optimizer/scheduler state for non-accelerated clones.
+
+        :param clone: Clone instance receiving optimizer/scheduler states.
+        :type clone: Self
+        """
+        if self.accelerator is not None:
+            return
+
+        clone.optimizer.optimizer.load_state_dict(
+            state_dict=self.optimizer.optimizer.state_dict(),
+        )
+        if self.lr_scheduler is not None and clone.lr_scheduler is not None:
+            clone.lr_scheduler.load_state_dict(self.lr_scheduler.state_dict())
+
+    def _load_clone_distributed_actor_state(self, clone: Self, work_dir: str) -> None:
+        """Load saved distributed actor state into clone for ZeRO-2/3.
+
+        :param clone: Clone instance receiving distributed actor state.
+        :type clone: Self
+        :param work_dir: Shared clone workspace directory.
+        :type work_dir: str
+        """
+        if self.zero_stage is not None and self.zero_stage >= 2:
+            clone.accelerator.wait_for_everyone()
+            clone._load_distributed_actor(f"{work_dir}/agent_{self.index}")
+            clone.accelerator.wait_for_everyone()
+        elif self.accelerator is not None:
+            self.accelerator.wait_for_everyone()
 
     @staticmethod
     def update_lr(
         optimizer: torch.optim.Optimizer,  # Deepspeed optimizers are subclasses of torch.optim.Optimizer
-        lr: float,
+        lr: float | tuple[float, float],
         accelerator: Accelerator | None = None,
         scheduler_config: CosineLRScheduleConfig | None = None,
     ) -> tuple[Accelerator | None, SequentialLR | None]:
@@ -2483,8 +2940,8 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
 
         :param optimizer: Optimizer
         :type optimizer: Optimizer
-        :param lr: Learning rate
-        :type lr: float
+        :param lr: Learning rate value, or actor/critic pair.
+        :type lr: float | tuple[float, float]
         :param accelerator: Accelerator
         :type accelerator: Accelerator | None
         :param scheduler_config: Scheduler configuration
@@ -2493,8 +2950,25 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
         :return: Tuple of accelerator and scheduler
         :return: Accelerator
         """
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
+        if isinstance(lr, tuple):
+            lr_actor, lr_critic = lr
+            lr = lr_actor
+        else:
+            lr_critic = None
+
+        split = lr_critic is not None and any(
+            "group" in pg for pg in optimizer.param_groups
+        )
+        if split:
+            for param_group in optimizer.param_groups:
+                g = param_group.get("group")
+                if g == "critic":
+                    param_group["lr"] = lr_critic
+                elif g == "actor":
+                    param_group["lr"] = lr
+        else:
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
 
         if accelerator is None:
             scheduler = (
@@ -2504,40 +2978,24 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
             )
             return accelerator, scheduler
 
-        if (
-            not hasattr(accelerator.state, "deepspeed_plugin")
-            or accelerator.state.deepspeed_plugin is None
-        ):
-            msg = "Accelerator must be instantiated with a deepspeed plugin."
-            raise ValueError(
-                msg,
+        ds_plugin = getattr(accelerator.state, "deepspeed_plugin", None)
+        if ds_plugin is None:
+            scheduler = (
+                create_warmup_cosine_scheduler(optimizer, scheduler_config, 1e-8, lr)
+                if scheduler_config is not None
+                else None
             )
+            return accelerator, scheduler
 
-        if not hasattr(accelerator.state.deepspeed_plugin, "deepspeed_config"):
-            msg = "Deepspeed config not found in accelerator state, make sure DeepSpeed is configured in your accelerator config."
-            raise ValueError(
-                msg,
-            )
+        ds_config = getattr(ds_plugin, "deepspeed_config", None)
+        if ds_config is None:
+            return accelerator, None
 
-        if (
-            accelerator.state.deepspeed_plugin.deepspeed_config.get("scheduler", None)
-            is not None
-        ):
-            accelerator.state.deepspeed_plugin.deepspeed_config["scheduler"]["params"][
-                "warmup_max_lr"
-            ] = lr
+        if ds_config.get("scheduler", None) is not None:
+            ds_config["scheduler"]["params"]["warmup_max_lr"] = lr
 
-        if (
-            accelerator.state.deepspeed_plugin.deepspeed_config is not None
-            and accelerator.state.deepspeed_plugin.deepspeed_config.get(
-                "optimizer",
-                None,
-            )
-            is not None
-        ):
-            accelerator.state.deepspeed_plugin.deepspeed_config["optimizer"]["params"][
-                "lr"
-            ] = lr
+        if ds_config.get("optimizer", None) is not None:
+            ds_config["optimizer"]["params"]["lr"] = lr
 
         return accelerator, None
 
@@ -2553,54 +3011,248 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
         if reference_update_tracker > self.reference_update_tracker:
             if self.accelerator is not None:
                 self.accelerator.wait_for_everyone()
-            # Merge adapter into base model
-            # Update the reference update tracker
             if self.use_separate_reference_adapter:
-                # Activate both adapters
-                # Iterate over the params
-                ref_param = None
-                actor_param = None
-                for name, param in self.actor.named_parameters():
-                    if "lora" in name:
-                        if "reference" in name:
-                            ref_param = param
-                        elif "actor" in name:
-                            actor_param = param
-                        else:
-                            msg = f"Only adapter names 'actor' and 'reference' are allowed, nether was found in {name}"
-                            raise ValueError(
-                                msg,
-                            )
-                    if ref_param is not None and actor_param is not None:
-                        ref_param.data.copy_(actor_param.data)
-                        ref_param = None
-                        actor_param = None
-            else:
-                if self.accelerator is not None:
-                    merged_base_model = self.accelerator.unwrap_model(
-                        self.actor,
-                    ).merge_and_unload()
-                else:
-                    merged_base_model = self.actor.merge_and_unload()
-                self.actor = None  # De-reference the old actor base model
-                self.actor = get_peft_model(
-                    merged_base_model,
-                    self.lora_config,
-                    adapter_name="actor",
+                self._copy_adapter_weights(
+                    source_adapter="actor", target_adapter="reference"
                 )
+            else:
+                unwrapped = self._get_unwrapped_actor()
+                peft_model = (
+                    unwrapped.pretrained_model if self.use_value_head else unwrapped
+                )
+                with gather_if_zero3(self.zero_stage, list(peft_model.parameters())):
+                    self._merge_adapter_into_base_in_place(
+                        peft_model=peft_model,
+                        adapter_name="actor",
+                    )
                 if self.accelerator is not None:
                     self.accelerator.wait_for_everyone()
-                self.actor.set_adapter("actor")
-
-                # Reinit optimizer
-                optim_class = self._select_optim_class()
-                self.optimizer = OptimizerWrapper(
-                    optim_class,
-                    networks=[self.actor],
-                    lr=self.lr,
-                )
-                self.wrap_models()
+                self.use_adapter("actor")
             self.reference_update_tracker += 1
+
+    def _merge_adapter_into_base_in_place(
+        self,
+        peft_model: Any,
+        adapter_name: str,
+    ) -> None:
+        """Manually add one LoRA adapter delta into dense base weights.
+
+        Unlike ``merge_adapter``, this does not flip LoRA layers to a merged
+        runtime mode, so actor LoRA params remain trainable after the merge.
+
+        :param peft_model: PEFT model that owns the adapter.
+        :type peft_model: Any
+        :param adapter_name: Adapter to merge into the dense base.
+        :type adapter_name: str
+        """
+        peft_model.set_adapter(adapter_name)
+        merged_any = False
+        with torch.no_grad():
+            for module in peft_model.base_model.model.modules():
+                is_lora_like = (
+                    hasattr(module, "lora_A")
+                    and hasattr(module, "lora_B")
+                    and hasattr(module, "lora_bias")
+                    and hasattr(module, "lora_variant")
+                    and hasattr(module, "get_base_layer")
+                    and hasattr(module, "get_delta_weight")
+                    and hasattr(module, "scaling")
+                )
+                if not is_lora_like or adapter_name not in module.lora_A:
+                    continue
+
+                base_layer = module.get_base_layer()
+                if adapter_name in module.lora_variant:
+                    module.lora_variant[adapter_name].merge_unsafe(
+                        module,
+                        adapter_name,
+                        base_layer.weight,
+                    )
+                else:
+                    delta_weight = module.get_delta_weight(adapter_name)
+                    base_layer.weight.data += delta_weight.to(base_layer.weight.dtype)
+
+                if module.lora_bias[adapter_name]:
+                    if getattr(base_layer, "bias", None) is None:
+                        msg = (
+                            "Cannot merge LoRA bias into base layer because bias is "
+                            "missing."
+                        )
+                        raise RuntimeError(msg)
+                    base_layer.bias.data += (
+                        module.lora_B[adapter_name].bias * module.scaling[adapter_name]
+                    ).to(base_layer.bias.dtype)
+
+                if hasattr(module, "reset_lora_parameters"):
+                    module.reset_lora_parameters(
+                        adapter_name,
+                        init_lora_weights=True,
+                    )
+                else:
+                    # Keep behavior aligned with PEFT defaults: A random init,
+                    # B zeros so the post-merge adapter delta starts neutral.
+                    torch.nn.init.kaiming_uniform_(
+                        module.lora_A[adapter_name].weight,
+                        a=5**0.5,
+                    )
+                    torch.nn.init.zeros_(module.lora_B[adapter_name].weight)
+                merged_any = True
+
+        if not merged_any:
+            msg = f"No LoRA tensors found for adapter '{adapter_name}'."
+            raise ValueError(msg)
+
+    def use_adapter(self, adapter_name: str) -> None:
+        """Switch the active PEFT adapter, handling all side-effects.
+
+        For "reference": switches adapter and freezes reference params (never trained).
+        For all others: switches adapter and restores requires_grad=True on all
+        training adapter LoRA params so that DeepSpeed ZeRO-2 gradient bucket hooks
+        keep firing correctly.
+
+        :param adapter_name: Name of the adapter to activate ("actor", "critic", "reference").
+        :type adapter_name: str
+        """
+        peft_model = self._peft_model
+        if adapter_name == "reference":
+            if self.use_separate_reference_adapter:
+                peft_model.set_adapter("reference")
+                for name, param in self.actor.named_parameters():
+                    if param is not None and "reference" in name:
+                        param.requires_grad = False
+            else:
+                peft_model.base_model.disable_adapter_layers()
+        else:
+            if self.use_separate_reference_adapter:
+                peft_model.set_adapter(adapter_name)
+            else:
+                peft_model.base_model.enable_adapter_layers()
+        self._restore_adapter_trainability(["actor", "critic"])
+
+    @contextmanager
+    def select_adapter(self, adapter_name: str) -> None:
+        """Temporarily switch adapter; restores the actor adapter on exit.
+
+        :param adapter_name: Name of the adapter to activate ("actor", "critic", "reference").
+        :type adapter_name: str
+        """
+        self.use_adapter(adapter_name)
+        try:
+            yield
+        finally:
+            self.use_adapter("actor")
+
+    def _select_optim_class(self) -> type[OptimizerType | DummyOptimizer]:
+        """Select the optimizer class based on the accelerator and deepspeed config.
+
+        :return: Optimizer class
+        :rtype: type[torch.optim.Optimizer] | type[DummyOptimizer]
+        """
+        if (
+            self.accelerator is not None
+            and self.accelerator.state.deepspeed_plugin is not None
+            and self.accelerator.state.deepspeed_plugin.deepspeed_config.get(
+                "optimizer",
+                None,
+            )
+            is not None
+        ):
+            return DummyOptimizer
+        return AdamW
+
+    def _save_distributed_actor(
+        self,
+        path: str,
+        tag: str = "intermediate_checkpoint",
+        lora_only: bool = False,
+    ) -> None:
+        """Save actor/optimizer/scheduler state via DeepSpeed checkpointing.
+
+        :param path: Output directory to save the checkpoint at
+        :type path: str
+        """
+        if self.accelerator is not None:
+            Path(path).mkdir(parents=True, exist_ok=True)
+            assert self.actor is not None, (
+                "Actor is not defined, please check that the actor is defined."
+            )
+            # Keep reference adapter frozen in DeepSpeed checkpoints so frozen
+            # param fragments are emitted consistently on save/load roundtrips.
+            trainable_adapters = [
+                name for name in self.selected_adapters if name != "reference"
+            ]
+            self._restore_adapter_trainability(trainable_adapters)
+            self.actor.save_checkpoint(
+                path, tag=tag, exclude_frozen_parameters=lora_only
+            )
+            self.use_adapter("actor")
+        else:
+            warnings.warn(
+                "Distributed actor save not supported for non-distributed training.",
+                stacklevel=2,
+            )
+
+    def _load_distributed_actor(
+        self,
+        path: str,
+        tag: str = "intermediate_checkpoint",
+        load_optimizer_states: bool = True,
+        load_lr_scheduler_states: bool = True,
+    ) -> None:
+        """Override the load_checkpoint method to provide guidance on the correct method to use.
+
+        :param path: Output directory to load the checkpoint from
+        :type path: str
+        """
+        if self.accelerator is not None:
+            deepspeed_dirs = sorted(Path(path).glob(tag))
+            try:
+                assert len(deepspeed_dirs) > 0
+                load_path, _ = self.actor.load_checkpoint(
+                    str(path),
+                    tag=tag,
+                    load_module_strict=False,
+                    load_optimizer_states=load_optimizer_states,
+                    load_lr_scheduler_states=load_lr_scheduler_states,
+                )
+                if load_path is None:
+                    msg = (
+                        "Load path is returned as None from deepspeed load_checkpoint."
+                    )
+                    raise ValueError(
+                        msg,
+                    )
+                self.use_adapter("actor")
+
+            except Exception as e:
+                msg = f"Deepspeed failed to resume from checkpoint {path}"
+                raise ValueError(
+                    msg,
+                ) from e
+        else:
+            warnings.warn(
+                "Distributed actor load not supported for non-distributed training.",
+                stacklevel=2,
+            )
+
+    def _warn_peft_model(
+        self,
+        peft_model: PeftModelProtocol,
+        *,
+        context: str,
+    ) -> PreTrainedModelProtocol:
+        """Merge active adapters into the base weights and drop the PEFT wrapper.
+
+        Emits ``UserWarning`` so callers know adapter tensors are not preserved as
+        separate PEFT adapters; forward behavior is kept in the merged dense model.
+        """
+        warnings.warn(
+            f"{context}: A PeftModel was passed; calling merge_and_unload() to merge active adapter weights "
+            "into the dense base model before attaching new randomly initialized AgileRL adapters.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return peft_model.merge_and_unload()
 
     def _initialize_actors(
         self,
@@ -2608,6 +3260,11 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
         add_adapters: bool = True,
     ) -> None:
         """Initialize the actor network.
+
+        If ``base_model`` is a user-supplied :class:`~peft.PeftModel` (with
+        ``add_adapters`` True), active adapters are merged into the dense base and
+        the PEFT wrapper is removed before attaching AgileRL adapters. The clone path
+        (``add_adapters`` False) passes through the model unchanged.
 
         :param base_model: Base model
         :type base_model: PreTrainedModelProtocol
@@ -2617,41 +3274,106 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
         if base_model is None:
             base_model = create_model_from_name_or_path(
                 self.pretrained_model_name_or_path,
+                add_value_head=self.use_value_head,
+                use_accelerator=self.accelerator is not None,
             )
 
-        if isinstance(base_model, PeftModelProtocol) and add_adapters:
-            # Handles backwards compatibility with user providing a peft model as the actor network
-            if self.lora_config is None:
-                adapter_name = list(base_model.peft_config.keys())
-                self.lora_config = base_model.peft_config[adapter_name[0]]
-            with gather_if_zero3(self.zero_stage, list(base_model.parameters())):
-                base_model = base_model.merge_and_unload()
-            if "default" in list(base_model.peft_config.keys()):
-                base_model.peft_config.pop("default")
+        if add_adapters:
+            if isinstance(base_model, PeftModelProtocol):
+                base_model = self._warn_peft_model(
+                    base_model,
+                    context="actor_network",
+                )
 
-        self.actor: PeftModelProtocol = (
-            get_peft_model(base_model, self.lora_config, adapter_name="actor")
-            if add_adapters
-            else base_model
-        )
+            if self.use_value_head and isinstance(
+                getattr(base_model, "pretrained_model", None), PeftModelProtocol
+            ):
+                inner = base_model.pretrained_model
+                base_model.pretrained_model = self._warn_peft_model(
+                    inner,
+                    context="actor_network.pretrained_model",
+                )
 
-        if self.use_separate_reference_adapter and add_adapters:
-            self.actor.add_adapter(
-                adapter_name="reference",
-                peft_config=self.lora_config,  # type: ignore[arg-type]
+            peft_target = (
+                base_model.pretrained_model if self.use_value_head else base_model
+            )
+            # User Peft is merged to dense above; always attach AgileRL adapters here.
+            peft_target = get_peft_model(
+                peft_target,
+                self.lora_config,
+                adapter_name="actor",
             )
 
-        self.actor.set_adapter("actor")
+            # Add every adapter listed in ``selected_adapters`` beyond ``actor`` as a fresh
+            # LoRA initialised from ``self.lora_config``. Downstream loads can overwrite
+            # these (with padding for rank-mutation) via :meth:`_load_adapter_weights`.
+            for name in self.selected_adapters:
+                if name == "actor":
+                    continue
+                if name not in peft_target.peft_config:
+                    peft_target.add_adapter(
+                        adapter_name=name,
+                        peft_config=self.lora_config,  # type: ignore[arg-type]
+                    )
+
+            # Drop any adapters we don't own (e.g. from a user-supplied PEFT model).
+            for stray in list(peft_target.peft_config.keys()):
+                if stray not in self.selected_adapters:
+                    warnings.warn(
+                        f"Adapter '{stray}' found in the model but is not listed in "
+                        f"`selected_adapters={self.selected_adapters!r}`. It will be removed "
+                        "and any weights will be lost.",
+                        stacklevel=2,
+                    )
+                    peft_target.delete_adapter(stray)
+
+            if self.use_value_head:
+                base_model.pretrained_model = peft_target
+                base_model.is_peft_model = True
+                self.actor = base_model
+            else:
+                self.actor = peft_target
+        else:
+            self.actor = base_model
+
+        self.use_adapter("actor")
+        patch_lora_for_fused_forward(self.actor)
+
+        if self.torch_compiler:
+            if self._uses_deepspeed:
+                warnings.warn(
+                    "torch_compiler is not yet compatible with DeepSpeed; "
+                    "compilation skipped for this run.",
+                    stacklevel=2,
+                )
+            else:
+                if self.gradient_checkpointing:
+                    warnings.warn(
+                        "torch_compiler is incompatible with gradient_checkpointing; "
+                        "disabling gradient checkpointing for this run.",
+                        stacklevel=2,
+                    )
+                    self.gradient_checkpointing = False
+                self.actor = compile_model(self.actor, self.torch_compiler)
 
         if self.accelerator is None:
             self.actor = DummyEvolvable(module=self.actor, device=self.device)
 
+        # If an optimizer is defined in the deepspeed config, then the optimizer is part of the engine when
+        # accelerator.prepare() is called. Since we are yet to wrap the model, we pass a dummy optimizer to the OptimizerWrapper.
+        # In all other cases optim.Adam is used.
         optim_class = self._select_optim_class()
+
         self.optimizer = OptimizerWrapper(
             optim_class,
             networks=[self.actor],
             lr=self.lr,
+            lr_critic=self.lr_critic,
+            is_llm_optimizer=True,
+            network_names=["actor"],
+            lr_name="lr" if self.lr_critic is None else ("lr_actor", "lr_critic"),
         )
+
         self.lr_scheduler = (
             create_warmup_cosine_scheduler(
                 (
@@ -2666,6 +3388,305 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
             if self.cosine_lr_schedule_config is not None
             else None
         )
+
+    @contextmanager
+    def _memory_efficient_params(self) -> None:
+        """Memory efficient params context manager.
+
+        :param agent: Distributed agent
+        :type agent: DistributedLLMAgent
+        :return: None
+        :rtype: None
+        """
+        if self.zero_stage == 3:
+            warnings.warn(
+                "Memory efficient params is not yet compatible with DeepSpeed ZeRO-3; "
+                "memory efficient params will be disabled for this run.",
+                stacklevel=2,
+            )
+            yield
+            return
+        unwrapped_model = self._get_unwrapped_actor()
+        move_params_to_gpu(unwrapped_model, self.device)
+        yield
+        move_params_to_cpu(unwrapped_model)
+
+    @contextmanager
+    def _amp_ctx(self):
+        """Yield a ``torch.amp.autocast`` context when running without an accelerator.
+
+        When an ``Accelerator`` is present it already manages mixed-precision
+        via its own autocast wrapper, so this is a no-op in that case.
+        """
+        if self.accelerator is not None:
+            yield
+        else:
+            device_type = torch.device(self.device).type
+            if device_type == "cuda" and torch.cuda.is_bf16_supported():
+                with torch.amp.autocast(device_type, dtype=torch.bfloat16):
+                    yield
+            else:
+                yield
+
+    def _fused_model_pass(
+        self,
+        fused_ids: torch.Tensor,
+        fused_mask: torch.Tensor,
+        routing: list[str],
+        batch_size: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run the model on a fused batch with per-sample adapter routing.
+
+        When *batch_size* is ``None`` the full batch is processed in a single
+        ``model.forward`` call — required when gradients are active so that
+        gradient-checkpoint recomputation sees the same routing.  When set,
+        the batch is iterated in micro-batches (safe under ``no_grad``).
+
+        :return: ``(log_probs, values)`` where *log_probs* has shape
+            ``(fused_ids.shape[0], seq_len - 1)`` and *values* matches that
+            batch dimension when ``use_value_head`` is set, else ``None``.
+        """
+        unwrapped = self._get_unwrapped_actor()
+        total = fused_ids.shape[0]
+        seq_len_out = fused_ids.shape[1] - 1
+
+        position_ids = None
+        if self.calc_position_embeddings:
+            position_ids = fused_mask.long().cumsum(dim=-1) - 1
+            position_ids.masked_fill_(mask=(fused_mask == 0), value=1)
+
+        chunks = (
+            [(0, total)]
+            if batch_size is None
+            else [(s, min(s + batch_size, total)) for s in range(0, total, batch_size)]
+        )
+
+        # Fused-linear-logprob path: replace lm_head with nn.Identity for the
+        # no-grad forward, then compute per-token logprobs via a chunked
+        # matmul over the lm_head weight. Skips materializing (B, T, V).
+        # Only safe when grads are disabled — autograd graph would not
+        # capture the manual matmul.
+        use_fused_lp = self.use_fused_linear_logprobs and not torch.is_grad_enabled()
+        if use_fused_lp:
+            lm_head = self._get_lm_head()
+            lm_head_weight = lm_head.weight
+            lm_head_bias = lm_head.bias
+
+        def _process_chunk(
+            start: int, end: int
+        ) -> tuple[torch.Tensor, torch.Tensor | None]:
+            set_fused_adapter_routing(unwrapped, routing[start:end])
+            model_kwargs: dict = {
+                "input_ids": fused_ids[start:end],
+                "attention_mask": fused_mask[start:end],
+                "use_cache": False,
+            }
+            if position_ids is not None:
+                model_kwargs["position_ids"] = position_ids[start:end]
+
+            patch_ctx = (
+                self._patch_lm_head_to_identity() if use_fused_lp else nullcontext()
+            )
+            with patch_ctx, self._amp_ctx():
+                output = self.actor.forward(**model_kwargs)
+
+            if isinstance(output, tuple):
+                # Value-head models may return (loss, logits, value, ...); Peft/causal
+                # paths may return shorter tuples — only index when present. With
+                # lm_head identity-patched, output[0] is the last hidden state.
+                first = output[0]
+                value = output[2] if len(output) > 2 else None
+            else:
+                first = output.logits
+                value = None
+            del output
+
+            if use_fused_lp:
+                chunk_lp = LLMAlgorithm._logprobs_from_hidden_fused(
+                    first[:, :-1],
+                    lm_head_weight,
+                    lm_head_bias,
+                    fused_ids[start:end, 1:],
+                    temperature=self.temperature,
+                    cast_to_fp32=self.cast_logprobs_to_fp32,
+                )
+                del first
+            else:
+                logits = first / self.temperature
+                del first
+                chunk_lp = LLMAlgorithm._logprobs_from_logits(
+                    logits[:, :-1],
+                    fused_ids[start:end, 1:],
+                    cast_to_fp32=self.cast_logprobs_to_fp32,
+                )
+                del logits
+
+            chunk_v = (
+                value[:, :-1] if (self.use_value_head and value is not None) else None
+            )
+            return chunk_lp, chunk_v
+
+        # Single-chunk fast path: skip the buffer + copy entirely.
+        if len(chunks) == 1:
+            return _process_chunk(0, total)
+
+        # Multi-chunk path: pre-allocate output buffers once and write each
+        # chunk in place via copy_(). Avoids holding the full list of chunk
+        # tensors plus the concatenated buffer in memory at the same time
+        # (which doubles peak memory in the torch.cat path).
+        logprobs_out: torch.Tensor | None = None
+        values_out: torch.Tensor | None = None
+
+        for start, end in chunks:
+            chunk_lp, chunk_v = _process_chunk(start, end)
+
+            # Lazy-allocate on the first chunk so we inherit dtype/device
+            # from the model output rather than guessing up front.
+            if logprobs_out is None:
+                logprobs_out = torch.empty(
+                    (total, seq_len_out),
+                    dtype=chunk_lp.dtype,
+                    device=chunk_lp.device,
+                )
+            logprobs_out[start:end].copy_(chunk_lp)
+            del chunk_lp
+
+            if chunk_v is not None:
+                if values_out is None:
+                    values_out = torch.empty(
+                        (total, seq_len_out),
+                        dtype=chunk_v.dtype,
+                        device=chunk_v.device,
+                    )
+                values_out[start:end].copy_(chunk_v)
+                del chunk_v
+
+        return logprobs_out, values_out
+
+    def _fused_forward(
+        self,
+        ids: torch.Tensor,
+        batch_size: int,
+        attention_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Actor log-probs, and optionally critic values, in one forward.
+
+        When ``use_value_head`` is set, the input is doubled (actor slice then
+        critic slice) and routed so the base model runs once. Otherwise only
+        the actor slice is run.
+
+        The doubled batch (value-head path) is always processed in one
+        ``model.forward`` call to preserve gradient-checkpoint correctness.
+
+        .. note::
+
+           The routing is **not** cleared here — it must remain active until
+           after ``backward()`` completes (for gradient checkpoint
+           recomputation).  Callers must call
+           ``clear_fused_adapter_routing`` after the backward pass.
+
+           Callers are responsible for ensuring the model is in training
+           mode and adapter trainability is restored before entering the
+           minibatch loop (see ``learn()`` in ``ppo_llm.py``).
+
+        :param ids: Token IDs ``(B, seq_len)``.
+        :param batch_size: Unused (kept for API symmetry).
+        :param attention_mask: Optional attention mask matching *ids*.
+        :return: ``(actor_log_probs, critic_values)`` with shapes ``(B, seq_len-1)``;
+            *critic_values* is ``None`` when no value head is used.
+        """
+        B = ids.shape[0]
+        if attention_mask is None:
+            attention_mask = ids != self.pad_token_id
+        if self.use_value_head:
+            fused_ids = ids.repeat(2, 1)
+            fused_mask = attention_mask.repeat(2, 1)
+            routing = ["actor"] * B + ["critic"] * B
+        else:
+            fused_ids = ids
+            fused_mask = attention_mask
+            routing = ["actor"] * B
+
+        log_probs, values = self._fused_model_pass(
+            fused_ids,
+            fused_mask,
+            routing,
+        )
+        if self.use_value_head:
+            return log_probs[:B], values[B:]
+        return log_probs, None
+
+    def _fused_forward_no_grad(
+        self,
+        ids: torch.Tensor,
+        batch_size: int,
+        attention_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Compute reference log-probs, actor log-probs, and critic values in
+        one forward pass (under ``torch.no_grad``).
+
+        When ``use_separate_reference_adapter`` is ``True``, the batch is
+        tripled (reference / actor / critic).  When ``False``, reference
+        log-probs are computed separately (adapter layers disabled) and the
+        actor/critic portion is double-fused.
+
+        Unlike ``_fused_forward`` this method **can** micro-batch because no
+        gradient checkpoint recomputation is involved.
+
+        :param ids: Token IDs ``(B, seq_len)``.
+        :param batch_size: Micro-batch size for memory-bounded iteration.
+        :param attention_mask: Optional attention mask matching *ids*.
+        :return: ``(reference_log_probs, actor_log_probs, critic_values)``
+            each of shape ``(B, seq_len - 1)``.
+        """
+        B = ids.shape[0]
+        if attention_mask is None:
+            attention_mask = ids != self.pad_token_id
+
+        self.actor.eval()
+
+        with torch.inference_mode():
+            if self.use_separate_reference_adapter:
+                adapters = ["reference", "actor"]
+            else:
+                adapters = ["actor"]
+
+            if self.use_value_head:
+                adapters.append("critic")
+
+            N = len(adapters)
+            fused_ids = ids.repeat(N, 1)
+            fused_mask = attention_mask.repeat(N, 1)
+            routing: list[str] = []
+            for adapter in adapters:
+                routing.extend([adapter] * B)
+
+            log_probs, values = self._fused_model_pass(
+                fused_ids,
+                fused_mask,
+                routing,
+                batch_size=batch_size,
+            )
+            clear_fused_adapter_routing(self._get_unwrapped_actor())
+            critic_values = None
+            if self.use_separate_reference_adapter:
+                ref_logprobs = log_probs[:B]
+                actor_logprobs = log_probs[B : 2 * B]
+                if self.use_value_head:
+                    critic_values = values[2 * B :]
+            else:
+                ref_logprobs = self._get_logprobs(
+                    ids,
+                    batch_size=batch_size,
+                    use_reference=True,
+                    eval_mode=True,
+                    attention_mask=attention_mask,
+                )
+                actor_logprobs = log_probs[:B]
+                if self.use_value_head:
+                    critic_values = values[B:]
+
+        return ref_logprobs, actor_logprobs, critic_values
 
     def _get_logprobs(
         self,
@@ -2690,7 +3711,8 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
         :return: Log probabilities of the completion IDs.
         :rtype: torch.Tensor
         """
-        with self.select_policy(use_reference):
+        use_fused_lp = self.use_fused_linear_logprobs and not torch.is_grad_enabled()
+        with self.select_adapter("reference" if use_reference else "actor"):
             self.actor.train(mode=not eval_mode)
             num_samples = ids.shape[0]
             if attention_mask is None:
@@ -2699,6 +3721,11 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
             if self.calc_position_embeddings:
                 position_ids = attention_mask.long().cumsum(dim=-1) - 1
                 position_ids.masked_fill_(mask=(attention_mask == 0), value=1)
+
+            if use_fused_lp:
+                lm_head = self._get_lm_head()
+                lm_head_weight = lm_head.weight
+                lm_head_bias = lm_head.bias
 
             # Split the sample into batches
             log_probs = []
@@ -2714,179 +3741,282 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
                 if self.calc_position_embeddings:
                     batch_position_ids = position_ids[batch:end_idx, :]
                     batch_model_kwargs |= {"position_ids": batch_position_ids}
-                logits = self.actor.forward(**batch_model_kwargs).logits
-                logits = logits / self.temperature
-                log_prob = LLMAlgorithm._memory_efficient_logits(
-                    logits[:, :-1],
-                    batch_ids[:, 1:],
+                patch_ctx = (
+                    self._patch_lm_head_to_identity() if use_fused_lp else nullcontext()
                 )
+                with patch_ctx, self._amp_ctx():
+                    output = self.actor.forward(**batch_model_kwargs)
+                first = output[0] if isinstance(output, tuple) else output.logits
+
+                if use_fused_lp:
+                    log_prob = LLMAlgorithm._logprobs_from_hidden_fused(
+                        first[:, :-1],
+                        lm_head_weight,
+                        lm_head_bias,
+                        batch_ids[:, 1:],
+                        temperature=self.temperature,
+                        cast_to_fp32=self.cast_logprobs_to_fp32,
+                    )
+                else:
+                    logits = first / self.temperature
+                    log_prob = LLMAlgorithm._logprobs_from_logits(
+                        logits[:, :-1],
+                        batch_ids[:, 1:],
+                        cast_to_fp32=self.cast_logprobs_to_fp32,
+                    )
+                    logits = None
+
+                first = None
                 batch_model_kwargs = None
-                logits = None
                 log_probs.append(log_prob)
         return torch.cat(log_probs, dim=0)
 
-    def _backward_pass(self, loss: float) -> None:
-        """Perform a backward pass.
+    def _backward_pass(self, loss: torch.Tensor) -> None:
+        """Perform a backward pass and optimizer step.
 
-        :param loss: Loss
-        :type loss: float
+        :param loss: Combined loss.
         """
-        if self.accelerator is not None:
+        if self._uses_deepspeed:
             self.accelerator.backward(loss)
+            if self.lr_scheduler is not None:
+                self.lr_scheduler.step()
+                self.lr = self.lr_scheduler.get_last_lr()[0]
         else:
             loss.backward()
-            clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+
+            for group in self.optimizer.optimizer.param_groups:
+                clip_grad_norm_(group["params"], self.max_grad_norm)
+
             self.optimizer.step()
             self.optimizer.zero_grad()
-        if self.lr_scheduler is not None:
-            self.lr_scheduler.step()
-            self.lr = self.lr_scheduler.get_last_lr()[0]
+            if self.lr_scheduler is not None:
+                self.lr_scheduler.step()
+                self.lr = self.lr_scheduler.get_last_lr()[0]
 
-    @contextmanager
-    def select_policy(self, use_reference: bool = False) -> None:
-        """Select the policy."""
-        if use_reference:
-            self._use_reference_policy()
-        else:
-            self._use_policy()
-        yield
-        self._use_policy()
+    @property
+    def _peft_model(self) -> Any:
+        """The PeftModel managing LoRA adapters.
 
-    def _use_reference_policy(self) -> None:
-        """Use the reference policy."""
-        if self.use_separate_reference_adapter:
-            self.actor.set_adapter("reference")
-            for name, param in self.actor.named_parameters():
-                if param is not None and "reference" in name:
-                    param.requires_grad = False
-        else:
-            self.actor.base_model.disable_adapter_layers()
+        When ``use_value_head=True`` the PeftModel lives inside the
+        value-head wrapper at ``self.actor.pretrained_model``.
+        Otherwise ``self.actor`` itself is the PeftModel.
+        """
+        if self.use_value_head:
+            return self.actor.pretrained_model
+        return self.actor
 
-    def _use_policy(self) -> None:
-        """Use the policy."""
-        if self.use_separate_reference_adapter:
-            self.actor.set_adapter("actor")
-        else:
-            self.actor.base_model.enable_adapter_layers()
+    def _restore_adapter_trainability(self, selected_adapters: list[str]) -> None:
+        """Restore requires_grad=True for all trainable parameters of specified adapters.
+
+        PEFT's set_adapter() sets requires_grad=False on all non-active adapter
+        weights. Under DeepSpeed ZeRO Stage 2, gradient bucket hooks are registered
+        once at accelerator.prepare() time based on the requires_grad snapshot at
+        that moment. If set_adapter() later toggles requires_grad=False on params
+        that ZeRO-2 registered hooks for, those hooks never fire, the bucket never
+        completes, and reduce-scatter never runs - the optimizer sees zero gradients.
+
+        :param selected_adapters: LoRA adapter names whose params should be trainable.
+        :type selected_adapters: list[str]
+        """
+        key = tuple(sorted(selected_adapters))
+        cache = getattr(self, "_trainable_params_cache", None)
+        if cache is not None and cache[0] == key:
+            for param in cache[1]:
+                param.requires_grad_(True)
+            return
+
+        model = self.actor.module if hasattr(self.actor, "module") else self.actor
+        params: list[torch.nn.Parameter] = []
+        for name, param in model.named_parameters():
+            for adapter in selected_adapters:
+                if adapter in name and "lora" in name:
+                    params.append(param)
+                    break
+        for param in params:
+            param.requires_grad_(True)
+        self._trainable_params_cache = (key, params)
 
     def _move_model_to_vllm(self) -> None:
         """Move the deepspeed model to vllm."""
+        if self._vllm_moved:
+            return
         if self.accelerator is not None:
             self.accelerator.wait_for_everyone()
-        model_ref = self.accelerator.unwrap_model(self.actor)
-        model_ref.set_adapter("actor")
-        with gather_if_zero3(self.zero_stage, list(model_ref.parameters())):
-            model_ref.merge_adapter()
-            for name, param in model_ref.named_parameters():
+        model_ref = self._get_unwrapped_actor()
+        peft_ref = model_ref.pretrained_model if self.use_value_head else model_ref
+        peft_ref.set_adapter("actor")
+        with gather_if_zero3(self.zero_stage, list(peft_ref.parameters())):
+            peft_ref.merge_adapter(adapter_names=["actor"])
+            for name, param in peft_ref.named_parameters():
+                # weight_name = name.removeprefix("pretrained_model.")
                 weight_name = name.removeprefix("base_model.model.").replace(
-                    ".base_layer",
-                    "",
+                    ".base_layer", ""
                 )
-                if model_ref.prefix in weight_name:
+                # weight_name = weight_name.
+                if peft_ref.prefix in weight_name:
                     continue
 
                 if "original_module" in weight_name:
                     continue
 
+                if "summary" in weight_name:
+                    continue
+
                 llm_model = (
                     self.llm.llm_engine.model_executor.driver_worker.model_runner.model
                 )
-                llm_model.load_weights([(weight_name, param.data)])
-            model_ref.unmerge_adapter()
 
+                llm_model.load_weights([(weight_name, param.data)])
+            peft_ref.unmerge_adapter()
         self.llm.reset_prefix_cache()
+        self._vllm_moved = True
 
     def _generate_with_vllm_colocate(
-        self,
-        prompts: list[dict[str, int]],
-        group_size: int,
-    ) -> list[torch.Tensor]:
+        self, prompts: list[dict[str, Any]], group_size: int, temperature: float | None
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Generate completions with colocated vLLM for GRPO/LLMPPO-style batches.
+
+        Each entry in ``prompts`` is repeated ``group_size`` times so vLLM receives
+        a flat list of length ``len(prompts) * group_size`` (e.g. GRPO groups).
+
+        **Prompt dict fields:** ``input_ids`` and usually ``text`` for decoding.
+        For sliding-window multi-turn prompts, optionally set ``trajectory_input_ids``,
+        ``trajectory_text`` (decoded string passed to vLLM), ``stitch_prefix_ids``, and
+        ``initial_prompt_len`` (required when ``stitch_prefix_ids`` is
+        non-empty). Action masks use the full logical prompt length from
+        ``input_ids``, not only ``trajectory_input_ids``.
+
+        :param prompts: Length-``N`` list of observation dicts for this rank.
+        :type prompts: list[dict[str, Any]]
+        :param group_size: Repeat factor per prompt (1 for plain PPO).
+        :type group_size: int
+        :param temperature: Temperature for sampling.
+        :type temperature: float | None
+        :return: Per-prompt completion token tensors and matching action masks.
+        :rtype: tuple[list[torch.Tensor], list[torch.Tensor]]
+        """
         if SamplingParams is None:
             msg = "vLLM is required when use_vllm=True. Install AgileRL with vLLM support for this platform: `pip install agilerl[llm]`."
             raise ImportError(msg)
 
-        # I need to make the following happen
-        # prompts = [prompt1, prompt1, ..., prompt1 (group_size times), prompt2, prompt2, ..., prompt2 (group_size times), ...]
-
-        # The below line returns a list: [prompt1 * group_size, ..., promptN * group_size],
-        # where N is the data batch size per gpu, list length is group_size * N
-        group_prompts = [p for prompt in prompts for p in repeat(prompt, group_size)]
-        prompts_ids = [prompt["input_ids"] for prompt in group_prompts]
-        prompts_text = [prompt["text"] for prompt in group_prompts]
-        prompts_text = [
-            re.sub(rf"^({re.escape(str(self.pad_token))})+", "", text)
-            for text in prompts_text
-        ]
-
-        # max_output_tokens now acts as a global
         max_token_cap = (
             self.max_output_tokens
             if self.max_output_tokens is not None
             else self.max_model_len
         )
 
-        max_output_tokens = [
-            min(max_token_cap, self.max_model_len - len(prompt_id))
-            for prompt_id in prompts_ids
+        def _trajectory_input_ids(prompt: dict[str, Any]) -> torch.Tensor:
+            return cast(
+                "torch.Tensor",
+                prompt.get("trajectory_input_ids", prompt["input_ids"]),
+            )
+
+        def _token_prompt_for_vllm(ids: torch.Tensor) -> dict[str, list[int]]:
+            return {"prompt_token_ids": ids.squeeze(0).tolist()}
+
+        def _stitch_prefix(prompt: dict[str, Any], ref: torch.Tensor) -> torch.Tensor:
+            st = prompt.get("stitch_prefix_ids")
+            if st is None:
+                return ref.new_zeros((ref.shape[0], 0))
+            return cast("torch.Tensor", st)
+
+        def _vllm_max_new_tokens(model_prompt_len: int) -> int:
+            room = self.max_model_len - model_prompt_len
+            if room <= 0:
+                error_msg = f"Model prompt length ({model_prompt_len}) is greater than the model length ({self.max_model_len})"
+                raise ValueError(error_msg)
+            max_out = min(max_token_cap, room)
+            if self.min_output_tokens is not None:
+                max_out = max(max_out, min(self.min_output_tokens, room))
+            return min(max_out, room)
+
+        # Compute the per-prompt work once per *unique* prompt (N items),
+        # then alias by reference across each group (N·G items)
+        unique_ids = [_trajectory_input_ids(p) for p in prompts]
+        unique_tokens = [_token_prompt_for_vllm(ids) for ids in unique_ids]
+        unique_max = [_vllm_max_new_tokens(int(ids.shape[1])) for ids in unique_ids]
+        unique_stitch = [
+            _stitch_prefix(p, ids) for p, ids in zip(prompts, unique_ids, strict=True)
         ]
 
-        generation_kwargs = {
-            "n": 1,  # vLLM on each GPU generates only 1 in colocate mode
-            "repetition_penalty": self.repetition_penalty,
-            "temperature": self.temperature,
-            "top_p": self.top_p,
-            "top_k": -1 if self.top_k is None else self.top_k,
-            "min_p": 0.0 if self.min_p is None else self.min_p,
-            "min_tokens": (
-                0 if self.min_output_tokens is None else self.min_output_tokens
-            ),
-        }
-        sampling_params = [
-            SamplingParams(**generation_kwargs, max_tokens=max_output_token)
-            for max_output_token in max_output_tokens
-        ]
+        # Replicate by reference for the flat vLLM batch. Entries within a
+        # group of `group_size` are aliased references to the same tensor / dict
+        # — safe because downstream use is read-only is read-only w.r.t. these objects.
+        # Do not introduce in-place ops on these aliases.
+        group_prompts = [p for p in prompts for _ in range(group_size)]
+        prompts_ids = [ids for ids in unique_ids for _ in range(group_size)]
+        token_prompts = [tp for tp in unique_tokens for _ in range(group_size)]
+        max_output_tokens = [m for m in unique_max for _ in range(group_size)]
+        stitch_prefixes = [sp for sp in unique_stitch for _ in range(group_size)]
 
         if self.vllm_config.tensor_parallel_size > 1:
-            orig_size = len(prompts_text)
+            orig_size = len(token_prompts)
 
             gathered_prompts_ids = [
                 None for _ in range(self.vllm_config.tensor_parallel_size)
             ]
-            gathered_prompts_text = [
-                None for _ in range(self.vllm_config.tensor_parallel_size)
-            ]
+            gathered_token_prompts = [None] * self.vllm_config.tensor_parallel_size
+            gathered_stitch_prefixes = [None] * self.vllm_config.tensor_parallel_size
+            gathered_max_output_tokens = [None] * self.vllm_config.tensor_parallel_size
 
-            torch.distributed.all_gather_object(
-                gathered_prompts_ids,
-                prompts_ids,
-                group=self.tp_group,
-            )
-            torch.distributed.all_gather_object(
-                gathered_prompts_text,
-                prompts_text,
-                group=self.tp_group,
-            )
+            for gathered, obj in zip(
+                (
+                    gathered_prompts_ids,
+                    gathered_token_prompts,
+                    gathered_stitch_prefixes,
+                    gathered_max_output_tokens,
+                ),
+                (prompts_ids, token_prompts, stitch_prefixes, max_output_tokens),
+                strict=True,
+            ):
+                torch.distributed.all_gather_object(gathered, obj, group=self.tp_group)
 
             all_prompts_ids = [
                 prompt_id for sublist in gathered_prompts_ids for prompt_id in sublist
             ]
-            all_prompts_text = [
-                prompt_text
-                for sublist in gathered_prompts_text
-                for prompt_text in sublist
+            all_token_prompts = [
+                prompt for sublist in gathered_token_prompts for prompt in sublist
+            ]
+            all_stitch_prefixes = [
+                sp for sublist in gathered_stitch_prefixes for sp in sublist
+            ]
+            all_max_output_tokens = [
+                max_out for sublist in gathered_max_output_tokens for max_out in sublist
             ]
         else:
-            all_prompts_text = prompts_text
+            all_token_prompts = token_prompts
             all_prompts_ids = prompts_ids
+            all_stitch_prefixes = stitch_prefixes
+            all_max_output_tokens = max_output_tokens
+
+        generation_kwargs = {
+            "n": 1,  # vLLM on each GPU generates only 1 in colocate mode
+            "repetition_penalty": self.repetition_penalty,
+            "temperature": temperature,
+            "top_p": self.top_p,
+            "top_k": -1 if (self.top_k is None or self.top_k == 0) else self.top_k,
+            "min_p": 0.0 if self.min_p is None else self.min_p,
+            "min_tokens": (
+                0 if self.min_output_tokens is None else self.min_output_tokens
+            ),
+            "presence_penalty": self.vllm_config.presence_penalty,
+            "frequency_penalty": self.vllm_config.frequency_penalty,
+        }
+        if self.vllm_config.stop_sequences:
+            generation_kwargs["stop"] = self.vllm_config.stop_sequences
+        sampling_params = [
+            SamplingParams(**generation_kwargs, max_tokens=max_output_token)
+            for max_output_token in all_max_output_tokens
+        ]
 
         if self.accelerator is not None:
             self.accelerator.wait_for_everyone()
 
         all_outputs = self.llm.generate(
-            all_prompts_text,
+            all_token_prompts,
             sampling_params=sampling_params,
             use_tqdm=False,
-        )  # Change this to False
+        )
 
         completion_ids = [
             output.token_ids for outputs in all_outputs for output in outputs.outputs
@@ -2901,6 +4031,19 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
             )
             completion_ids = completion_ids[tp_slice]
             prompts_ids = all_prompts_ids[tp_slice]
+            stitch_prefixes = all_stitch_prefixes[tp_slice]
+
+        # Transfer fromn host-to-device once per unique prompt, then re-alias across the group.
+        unique_prompts_ids_dev = [
+            prompts_ids[group_size * i].to(self.device, non_blocking=True)
+            for i in range(len(prompts))
+        ]
+        unique_stitch_dev = [
+            stitch_prefixes[group_size * i].to(self.device, non_blocking=True)
+            for i in range(len(prompts))
+        ]
+        prompts_ids = [ids for ids in unique_prompts_ids_dev for _ in range(group_size)]
+        stitch_prefixes = [sp for sp in unique_stitch_dev for _ in range(group_size)]
 
         completion_ids = [
             torch.cat(
@@ -2920,70 +4063,175 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
             for i in range(len(prompts))
         ]
 
-        num_input_tokens = [prompt_ids.shape[1] for prompt_ids in prompts_ids][
-            ::group_size
+        if any(int(sp.shape[1]) > 0 for sp in stitch_prefixes):
+            completion_ids = stitch_completion_after_windowed_vllm_generate(
+                completion_ids,
+                stitch_prefixes,
+                group_prompts,
+                group_size,
+                prompts,
+            )
+
+        num_input_tokens = [
+            int(cast("torch.Tensor", prompts[i]["input_ids"]).shape[1])
+            for i in range(len(prompts))
         ]
-        action_masks = []
+        completion_masks = [
+            build_completion_mask(completion_id, num_input_tokens[i], self.pad_token_id)
+            for i, completion_id in enumerate(completion_ids)
+        ]
 
-        for i, completion_id in enumerate(completion_ids):
-            action_mask = torch.zeros_like(completion_id, device=self.device)
-            action_mask[:, num_input_tokens[i] :] = True
-            action_mask[completion_id == self.pad_token_id] = False
-            action_mask = action_mask[:, 1:]
-            action_masks.append(action_mask)
-
-        return completion_ids, action_masks
+        return completion_ids, completion_masks
 
     @staticmethod
-    def _memory_efficient_logits(
+    def _logprobs_from_logits(
         logits: torch.Tensor,
         index: torch.Tensor,
+        cast_to_fp32: bool = True,
+        _chunk_rows: int = 1,
     ) -> torch.Tensor:
-        """Calculate the log probabilities for a set of previously generated ids, looping to reduce peak memory consumption.
+        """Calculate log probabilities for previously generated token ids.
 
-        :param logits: Logits.
+        Processes ``_chunk_rows`` rows at a time so peak memory stays bounded to
+        ``(_chunk_rows, seq_len, vocab_size)`` rather than the full batch, avoiding
+        OOM on large-vocabulary models. Default ``_chunk_rows=1`` minimizes the
+        fp32 workspace at the cost of more kernel launches; raise to amortize
+        launch overhead when memory headroom allows.
+
+        With ``cast_to_fp32=True``, the per-chunk reduction (``amax`` /
+        ``gather`` / ``logsumexp``) runs in fp32 then casts the
+        ``(B, seq_len)`` output back to *logits* dtype. Matches the precision
+        of ``F.log_softmax`` over the same inputs to within the final bf16
+        cast. With ``cast_to_fp32=False`` the reduction stays in *logits*
+        dtype throughout — faster and lower peak (no fp32 workspace) at the
+        cost of bf16-quantisation error in the reduction.
+
+        Logits are max-centered per row before ``logsumexp``, matching
+        ``F.log_softmax`` stability either way.
+
+        :param logits: Logits of shape ``(B, seq_len, vocab_size)``.
         :type logits: torch.Tensor
-        :param index: Index.
+        :param index: Token IDs of shape ``(B, seq_len)``.
         :type index: torch.Tensor
-        :return: Log probabilities of the completion IDs.
+        :param cast_to_fp32: Promote each chunk to fp32 before the reduction.
+        :type cast_to_fp32: bool
+        :return: Log probabilities of the completion IDs, shape ``(B, seq_len)``.
         :rtype: torch.Tensor
         """
-        per_token_logps = []
-        for row_logits, row_labels in zip(logits, index, strict=False):
-            row_logps = F.log_softmax(row_logits, dim=-1)
-            row_per_token_logps = row_logps.gather(
-                dim=-1,
-                index=row_labels.unsqueeze(-1),
-            ).squeeze(-1)
-            per_token_logps.append(row_per_token_logps)
-        return torch.stack(per_token_logps)
+        orig_dtype = logits.dtype
+        B = logits.shape[0]
 
-    def _configure_batch_size(
+        def _logprobs_chunk(lg: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+            if cast_to_fp32:
+                lg = lg.float()
+            max_lg = lg.amax(dim=-1, keepdim=True)
+            shifted = lg - max_lg
+            target = shifted.gather(dim=-1, index=idx.unsqueeze(-1)).squeeze(-1)
+            log_z = torch.logsumexp(shifted, dim=-1)
+            result = target - log_z
+            return result.to(orig_dtype) if cast_to_fp32 else result
+
+        if B <= _chunk_rows:
+            return _logprobs_chunk(logits, index)
+
+        per_token_logps = []
+        for start in range(0, B, _chunk_rows):
+            end = min(start + _chunk_rows, B)
+            per_token_logps.append(
+                _logprobs_chunk(logits[start:end], index[start:end]),
+            )
+        return torch.cat(per_token_logps, dim=0)
+
+    @staticmethod
+    def _logprobs_from_hidden_fused(
+        hidden: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        lm_head_bias: torch.Tensor | None,
+        target_ids: torch.Tensor,
+        temperature: float = 1.0,
+        cast_to_fp32: bool = True,
+        _chunk_rows: int = 1024,
+    ) -> torch.Tensor:
+        """Per-token target logprobs without materializing the full ``(B, T, V)``
+        logits tensor.
+
+        Tiles flat over ``(B*T)`` with workspace bounded to ``(_chunk_rows, V)``
+        per iteration. Counterpart of :meth:`_logprobs_from_logits` for
+        callers that hold hidden states and the lm_head separately. **No-grad
+        only** — gradients won't flow to ``lm_head_weight`` from this fn.
+
+        Numerical contract matches :meth:`_logprobs_from_logits` when fed
+        equivalent inputs (``logits = (hidden @ Wᵀ + b) / T``): same
+        ``cast_to_fp32`` semantics, same final-cast-back-to-input-dtype, same
+        max-shift ``gather - logsumexp`` formulation. Default ``cast_to_fp32=True``
+        keeps the two paths bit-comparable.
+
+        :param hidden: ``(B, T, H)`` last-hidden-state.
+        :param lm_head_weight: ``(V, H)``.
+        :param lm_head_bias: ``(V,)`` or ``None``.
+        :param target_ids: ``(B, T)`` (caller does the ``[:, :-1]``/``[:, 1:]``
+            shift before calling).
+        :param temperature: scalar; logits divided by this before log_softmax
+            (skipped when ``1.0``).
+        :param cast_to_fp32: when True (default), run the per-chunk reduction
+            in fp32 then cast back. Same semantics as
+            :meth:`_logprobs_from_logits`.
+        :param _chunk_rows: rows of the flattened ``(B*T)`` workspace per
+            iteration; trades launch count vs ``_chunk_rows * V`` peak.
+        :return: ``(B, T)`` per-token logprobs in ``hidden.dtype``.
+        """
+        orig_dtype = hidden.dtype
+        B, T, H = hidden.shape
+        flat_h = hidden.reshape(-1, H)
+        flat_targets = target_ids.reshape(-1).to(torch.long)
+        N = flat_h.shape[0]
+        out = torch.empty(N, dtype=orig_dtype, device=hidden.device)
+        W_t = lm_head_weight.t()
+
+        for s in range(0, N, _chunk_rows):
+            e = min(s + _chunk_rows, N)
+            chunk_logits = flat_h[s:e] @ W_t
+            if lm_head_bias is not None:
+                chunk_logits.add_(lm_head_bias)
+            if temperature != 1.0:
+                chunk_logits.div_(temperature)
+            if cast_to_fp32:
+                chunk_logits = chunk_logits.float()
+            mx = chunk_logits.amax(dim=-1, keepdim=True)
+            chunk_logits.sub_(mx)
+            tgt = chunk_logits.gather(dim=-1, index=flat_targets[s:e, None]).squeeze(-1)
+            log_z = torch.logsumexp(chunk_logits, dim=-1)
+            del chunk_logits
+            result = tgt - log_z
+            out[s:e].copy_(result.to(orig_dtype) if cast_to_fp32 else result)
+
+        return out.reshape(B, T)
+
+    def _configure_batch_size_per_process(
         self,
         batch_size: int,
-        clone: bool,
-        reduce_memory_peak: bool,
         micro_batch_size_per_gpu: int | None,
     ) -> None:
-        if self.accelerator is None or clone:
+        if self.accelerator is None:
             self.batch_size_per_process = batch_size
+            if micro_batch_size_per_gpu is not None:
+                self.micro_batch_size_per_gpu = int(micro_batch_size_per_gpu)
+            else:
+                self.micro_batch_size_per_gpu = batch_size
             return
+
+        ds_plugin = self.accelerator.state.deepspeed_plugin
+        if ds_plugin is None:
+            err_msg = """DeepSpeed plugin is not initialized. If using an accelerator,
+            ensure to launch your training script with `accelerate launch --num_processes <your_script.py>`."""
+            raise ValueError(err_msg)
+        ds_config = ds_plugin.deepspeed_config
 
         if batch_size % self.accelerator.num_processes != 0:
             msg = f"Batch size ({batch_size}) must be divisible by the number of processes ({self.accelerator.num_processes})."
             raise ValueError(
                 msg,
             )
-
-        ds_config = self.accelerator.state.deepspeed_plugin.deepspeed_config
-
-        if reduce_memory_peak:
-            self.batch_size_per_process = 1
-            self.micro_batch_size_per_gpu = 1
-            ds_config["train_micro_batch_size_per_gpu"] = self.micro_batch_size_per_gpu
-            gradient_accumulation_steps = batch_size / self.accelerator.num_processes
-            ds_config["gradient_accumulation_steps"] = int(gradient_accumulation_steps)
-            return
 
         self.batch_size_per_process = int(batch_size / self.accelerator.num_processes)
 
@@ -2994,25 +4242,38 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
                 != 0
             ):
                 msg = (
-                    f"Batch size ({batch_size}) must be divisible by the product of the number of processes ({self.accelerator.num_processes}) and gradient accumulation steps ({self.accelerator.state.deepspeed_plugin.deepspeed_config.get('gradient_accumulation_steps', 1)})."
+                    f"Batch size ({batch_size}) must be divisible by the product of the number of processes ({self.accelerator.num_processes}) and gradient accumulation steps ({ds_config.get('gradient_accumulation_steps', 1)})."
                     "Gradient accumulation steps can be updated in the deepspeed config by changing the 'gradient_accumulation_steps' parameter."
                 )
                 raise ValueError(
                     msg,
                 )
-            self.micro_batch_size_per_gpu = (
-                self.batch_size_per_process
-                // ds_config.get("gradient_accumulation_steps", 1)
-            )
-            if self.micro_batch_size_per_gpu == 0:
-                msg = "Calculated micro_batch_size_per_gpu is 0..."
-                raise ValueError(msg)
 
-            if ds_config.get("train_micro_batch_size_per_gpu", "auto") == "auto":
-                ds_config["train_micro_batch_size_per_gpu"] = (
-                    self.micro_batch_size_per_gpu
+            gradient_accumulation_steps = ds_config.get(
+                "gradient_accumulation_steps", 1
+            )
+            self.micro_batch_size_per_gpu = (
+                self.batch_size_per_process // gradient_accumulation_steps
+            )
+
+            prev_micro = ds_config.get("train_micro_batch_size_per_gpu")
+            if prev_micro is not None:
+                warnings.warn(
+                    "Overwriting DeepSpeed config train_micro_batch_size_per_gpu "
+                    f"from {prev_micro!r} to {self.micro_batch_size_per_gpu} "
+                    f"(batch_size_per_process={self.batch_size_per_process} "
+                    f"// gradient_accumulation_steps={gradient_accumulation_steps}).",
+                    stacklevel=2,
                 )
+            ds_config["train_micro_batch_size_per_gpu"] = self.micro_batch_size_per_gpu
             return
+
+        if micro_batch_size_per_gpu == 0:
+            msg = (
+                "micro_batch_size_per_gpu is equal to zero, which is not allowed. "
+                "Please set micro_batch_size_per_gpu to a positive integer."
+            )
+            raise ValueError(msg)
 
         self.micro_batch_size_per_gpu = int(micro_batch_size_per_gpu)
         if (
@@ -3024,23 +4285,35 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
             raise ValueError(
                 msg,
             )
+        prev_micro = ds_config.get("train_micro_batch_size_per_gpu")
+        if prev_micro is not None:
+            warnings.warn(
+                "Overwriting DeepSpeed config train_micro_batch_size_per_gpu "
+                f"from {prev_micro!r} to {self.micro_batch_size_per_gpu} ",
+                stacklevel=2,
+            )
         ds_config["train_micro_batch_size_per_gpu"] = self.micro_batch_size_per_gpu
         gradient_accumulation_steps = (
             batch_size / self.accelerator.num_processes / self.micro_batch_size_per_gpu
         )
         warnings.warn(
-            f"Overwriting deepspeed config gradient accumulation steps from {self.accelerator.state.deepspeed_plugin.deepspeed_config.get('gradient_accumulation_steps', 'auto')} to {gradient_accumulation_steps}",
+            f"Overwriting deepspeed config gradient accumulation steps from {ds_config.get('gradient_accumulation_steps', 'auto')} to {gradient_accumulation_steps}",
             stacklevel=2,
         )
         ds_config["gradient_accumulation_steps"] = int(gradient_accumulation_steps)
         return
 
     def recompile(self) -> None:
-        """Recompiles the algorithm."""
-        msg = "Recompile method is not available for LLM finetuning algorithms."
-        raise NotImplementedError(
-            msg,
-        )
+        """Recompile evolvable modules with ``torch.compile``.
+
+        Iterates over ``evolvable_attributes`` and compiles each one.
+        Skipped when DeepSpeed is active because ``DeepSpeedEngine`` is not
+        compatible with ``OptimizedModule`` wrapping.
+        """
+        if self.torch_compiler is None or self._uses_deepspeed:
+            return
+        for name, obj in self.evolvable_attributes(networks_only=True).items():
+            setattr(self, name, compile_model(obj, self.torch_compiler))
 
     def _update_existing_adapter(
         self,
@@ -3048,7 +4321,7 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
         adapter_name: str,
     ) -> None:
         """Overwrite weights of an existing adapter in-place without creating new parameters.
-        xw
+
         :param checkpoint_dir: Checkpoint directory
         :type checkpoint_dir: str
         :param adapter_name: Adapter name
@@ -3057,34 +4330,383 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
         :return: None
         :rtype: None
         """
-        base_model = self.accelerator.unwrap_model(self.actor)
-        if hasattr(base_model, "module"):
-            base_model = base_model.module
+        unwrapped = self._get_unwrapped_actor()
+        peft_model = unwrapped.pretrained_model if self.use_value_head else unwrapped
 
         adapter_path = f"{checkpoint_dir}/{adapter_name}/adapter_model.safetensors"
-        adapter_state = load_file(adapter_path, device="cpu")
+        adapter_state = load_file(adapter_path, device=self.device)
 
         with gather_if_zero3(
             self.zero_stage,
-            list(base_model.parameters()),
+            list(unwrapped.parameters()),
             modifier_rank=0,
         ):
             with torch.no_grad():
                 set_peft_model_state_dict(
-                    base_model,
+                    peft_model,
                     adapter_state,
                     adapter_name=adapter_name,
                 )
-            base_model.set_adapter(adapter_name)
+            peft_model.set_adapter(adapter_name)
 
-            # Make reference weights not trainable
-            for name, param in base_model.named_parameters():
+            for name, param in unwrapped.named_parameters():
                 if "reference" in name:
                     param.requires_grad = False
+                elif "actor" in name or "critic" in name:
+                    param.requires_grad = True
         self.accelerator.wait_for_everyone()
 
+        if self.accelerator is not None:
+            self.accelerator.wait_for_everyone()
+
+    def _copy_adapter_weights(self, source_adapter: str, target_adapter: str) -> None:
+        """Copy LoRA weights from source adapter to target adapter."""
+        source_params = {}
+        target_params = {}
+        for name, param in self.actor.named_parameters():
+            if "lora" not in name:
+                continue
+            if f".{source_adapter}." in name:
+                key = name.replace(f".{source_adapter}.", ".", 1)
+                source_params[key] = param
+            elif f".{target_adapter}." in name:
+                key = name.replace(f".{target_adapter}.", ".", 1)
+                target_params[key] = param
+
+        if not source_params:
+            msg = f"No LoRA tensors found for source adapter '{source_adapter}'."
+            raise ValueError(
+                msg,
+            )
+        if not target_params:
+            msg = f"No LoRA tensors found for target adapter '{target_adapter}'."
+            raise ValueError(
+                msg,
+            )
+
+        missing = [key for key in source_params if key not in target_params]
+        if missing:
+            msg = (
+                f"Target adapter '{target_adapter}' is missing {len(missing)} LoRA tensors "
+                f"present in source adapter '{source_adapter}'."
+            )
+            raise ValueError(
+                msg,
+            )
+
+        for key, src_param in source_params.items():
+            target_params[key].data.copy_(src_param.data)
+
     @staticmethod
-    def create_prompt_masks(prompt_lengths: list[int], max_length: int) -> torch.Tensor:
+    def _load_checkpoint_lora_config(path: str) -> LoraConfig | None:
+        """Load the ``actor`` adapter's LoRA config from a checkpoint directory, if present.
+
+        :param path: Directory previously written by :meth:`save_checkpoint`.
+        :type path: str
+        :return: The ``LoraConfig`` stored alongside the actor adapter, or ``None`` if
+            the checkpoint does not contain one (legacy checkpoint, or no ``actor/`` subdir).
+        :rtype: peft.LoraConfig | None
+        """
+        config_path = Path(path) / "actor" / "adapter_config.json"
+        if not config_path.is_file():
+            return None
+        return LoraConfig.from_pretrained(str(config_path.parent))
+
+    @staticmethod
+    def _merge_lora_configs(
+        current: LoraConfig | None,
+        checkpoint: LoraConfig,
+    ) -> LoraConfig:
+        """Reconcile a checkpoint's LoRA config with the current one, favouring the current
+        where a choice must be made and warning on every mismatch.
+
+        Rules:
+
+        * ``r``: take ``max(current, checkpoint)`` (rank can grow via mutation).
+        * ``target_modules``, ``modules_to_save``: take the union when both are iterable,
+          otherwise keep current.
+        * Everything else: keep current, warn on mismatch.
+
+        :param current: The LoRA config the live algorithm was instantiated with. When
+            ``None`` the checkpoint's config is returned as-is.
+        :type current: peft.LoraConfig | None
+        :param checkpoint: The LoRA config stored alongside the checkpoint's actor adapter.
+        :type checkpoint: peft.LoraConfig
+        :return: A new ``LoraConfig`` representing the reconciled settings.
+        :rtype: peft.LoraConfig
+        """
+        if current is None:
+            return checkpoint
+
+        merged_kwargs = (
+            current.to_dict() if hasattr(current, "to_dict") else dict(vars(current))
+        )
+        ckpt_kwargs = (
+            checkpoint.to_dict()
+            if hasattr(checkpoint, "to_dict")
+            else dict(vars(checkpoint))
+        )
+
+        def _as_set(x: Any) -> set[str] | None:
+            if x is None:
+                return None
+            if isinstance(x, str):
+                return {x}
+            try:
+                return set(x)
+            except TypeError:
+                return None
+
+        for key, ckpt_val in ckpt_kwargs.items():
+            cur_val = merged_kwargs.get(key)
+            if key == "r":
+                cur_r = cur_val if isinstance(cur_val, int) else 0
+                ckpt_r = ckpt_val if isinstance(ckpt_val, int) else 0
+                new_r = max(cur_r, ckpt_r)
+                if cur_r != ckpt_r:
+                    warnings.warn(
+                        f"LoRA rank mismatch (current={cur_r}, checkpoint={ckpt_r}); "
+                        f"using max={new_r} and padding checkpoint weights into the extra rank slots.",
+                        stacklevel=2,
+                    )
+                merged_kwargs[key] = new_r
+                continue
+            if key in ("target_modules", "modules_to_save"):
+                cur_set = _as_set(cur_val)
+                ckpt_set = _as_set(ckpt_val)
+                if cur_set is None or ckpt_set is None:
+                    if cur_val != ckpt_val:
+                        warnings.warn(
+                            f"LoRA '{key}' differs (current={cur_val!r}, checkpoint={ckpt_val!r}); "
+                            "keeping the current value.",
+                            stacklevel=2,
+                        )
+                    continue
+                union = cur_set | ckpt_set
+                if cur_set != ckpt_set:
+                    warnings.warn(
+                        f"LoRA '{key}' differs (current={sorted(cur_set)}, checkpoint={sorted(ckpt_set)}); "
+                        f"using union={sorted(union)}.",
+                        stacklevel=2,
+                    )
+                merged_kwargs[key] = sorted(union)
+                continue
+            if cur_val != ckpt_val:
+                warnings.warn(
+                    f"LoRA '{key}' differs (current={cur_val!r}, checkpoint={ckpt_val!r}); "
+                    "keeping current value.",
+                    stacklevel=2,
+                )
+
+        return LoraConfig(**merged_kwargs)
+
+    @staticmethod
+    def _format_lora_config_mismatch_error(
+        current: LoraConfig,
+        checkpoint: LoraConfig,
+    ) -> str:
+        """Format a user-facing error for mismatched LoRA configs.
+
+        :param current: LoRA config from the live loading agent.
+        :type current: peft.LoraConfig
+        :param checkpoint: LoRA config persisted in the checkpoint.
+        :type checkpoint: peft.LoraConfig
+        :return: Error string with mismatch context and remediation.
+        :rtype: str
+        """
+
+        def summarize(cfg: LoraConfig) -> dict[str, Any]:
+            """Summarize key LoRA config fields for mismatch messages."""
+            cfg_dict = cfg.to_dict() if hasattr(cfg, "to_dict") else dict(vars(cfg))
+            summary_keys = (
+                "r",
+                "lora_alpha",
+                "target_modules",
+                "modules_to_save",
+                "bias",
+                "task_type",
+            )
+            summary = {key: cfg_dict.get(key) for key in summary_keys}
+            for key in ("target_modules", "modules_to_save"):
+                value = summary.get(key)
+                if isinstance(value, (set, tuple)):
+                    summary[key] = sorted(value)
+            return summary
+
+        current_summary = summarize(current)
+        checkpoint_summary = summarize(checkpoint)
+        return (
+            "LoRA configs differ; refusing to load checkpoint with "
+            "merge_lora_configs=False.\n"
+            f"Current config: {current_summary}\n"
+            f"Checkpoint config: {checkpoint_summary}\n"
+            "Resolution:\n"
+            "  1) Ensure the loading agent uses the checkpoint LoRA config, or\n"
+            "  2) call load_checkpoint(..., merge_lora_configs=True)."
+        )
+
+    @staticmethod
+    def _lora_configs_equivalent(a: LoraConfig, b: LoraConfig) -> bool:
+        """Structural equality for two ``LoraConfig`` instances.
+
+        List/tuple/set-typed fields (``target_modules`` etc.) are normalised to sorted
+        lists before comparison so insertion order does not matter.
+
+        :param a: First config.
+        :type a: peft.LoraConfig
+        :param b: Second config.
+        :type b: peft.LoraConfig
+        :return: ``True`` iff every keyword field is equal after normalisation.
+        :rtype: bool
+        """
+        ignore_keys = {"inference_mode"}
+        ordered_keys = ("target_modules", "modules_to_save", "exclude_modules")
+        a_dict = a.to_dict() if hasattr(a, "to_dict") else dict(vars(a))
+        b_dict = b.to_dict() if hasattr(b, "to_dict") else dict(vars(b))
+        for key in ordered_keys:
+            for d in (a_dict, b_dict):
+                val = d.get(key)
+                if isinstance(val, (list, tuple, set)):
+                    d[key] = sorted(val)
+        for key in ignore_keys:
+            a_dict.pop(key, None)
+            b_dict.pop(key, None)
+        return a_dict == b_dict
+
+    def _reconfigure_adapters_to_match(self, target_config: LoraConfig) -> None:
+        """Ensure every adapter in :attr:`selected_adapters` uses ``target_config``.
+
+        If an adapter's live config already matches, it is left untouched. Otherwise it
+        is rebuilt against ``target_config`` with freshly-initialised weights; callers
+        are expected to subsequently load weights into it (with rank padding where
+        needed).
+
+        :param target_config: The merged LoRA config that all adapters should match.
+        :type target_config: peft.LoraConfig
+        :return: None. Mutates the live PEFT model in place.
+        :rtype: None
+        """
+        peft_model = self._peft_model
+        if not isinstance(peft_model, PeftModelProtocol):
+            return
+
+        current_adapter = (
+            peft_model.active_adapter
+            if hasattr(peft_model, "active_adapter")
+            else "actor"
+        )
+        for name in self.selected_adapters:
+            live_cfg = peft_model.peft_config.get(name)
+            if live_cfg is not None and self._lora_configs_equivalent(
+                live_cfg, target_config
+            ):
+                continue
+            with gather_if_zero3(
+                self.zero_stage, list(peft_model.parameters()), modifier_rank=0
+            ):
+                if name in peft_model.peft_config:
+                    peft_model.delete_adapter(name)
+                peft_model.add_adapter(adapter_name=name, peft_config=target_config)
+        if current_adapter in peft_model.peft_config:
+            peft_model.set_adapter(current_adapter)
+        else:
+            peft_model.set_adapter("actor")
+
+    def _load_adapter_weights(
+        self,
+        checkpoint_dir: str,
+        adapter_name: str,
+        ckpt_lora_config: LoraConfig | None,
+    ) -> None:
+        """Overwrite a live adapter's weights from disk, padding smaller LoRA ranks into
+        the current adapter shape where needed.
+
+        :param checkpoint_dir: Directory written by :meth:`save_checkpoint`; must contain
+            ``<adapter_name>/adapter_model.safetensors``.
+        :type checkpoint_dir: str
+        :param adapter_name: Name of the adapter to overwrite (must already exist on the
+            live PEFT model).
+        :type adapter_name: str
+        :param ckpt_lora_config: The checkpoint's LoRA config, used to detect a rank
+            mismatch that requires padding. Pass ``None`` to skip padding entirely.
+        :type ckpt_lora_config: peft.LoraConfig | None
+        :return: None. Mutates the live adapter's parameters in place.
+        :rtype: None
+        """
+        unwrapped = self._get_unwrapped_actor()
+        peft_model = unwrapped.pretrained_model if self.use_value_head else unwrapped
+
+        adapter_path = f"{checkpoint_dir}/{adapter_name}/adapter_model.safetensors"
+        adapter_state = load_file(adapter_path, device=str(self.device))
+
+        with gather_if_zero3(
+            self.zero_stage, list(unwrapped.parameters()), modifier_rank=0
+        ):
+            if (
+                ckpt_lora_config is not None
+                and self.lora_config is not None
+                and getattr(ckpt_lora_config, "r", None)
+                != getattr(self.lora_config, "r", None)
+            ):
+                adapter_state = self._pad_adapter_state_to_live_shape(
+                    adapter_state, adapter_name, peft_model
+                )
+
+            with torch.no_grad():
+                set_peft_model_state_dict(
+                    peft_model, adapter_state, adapter_name=adapter_name
+                )
+            peft_model.set_adapter(adapter_name)
+
+            for name, param in unwrapped.named_parameters():
+                if "reference" in name:
+                    param.requires_grad = False
+
+        if self.accelerator is not None:
+            self.accelerator.wait_for_everyone()
+
+    @staticmethod
+    def _pad_adapter_state_to_live_shape(
+        adapter_state: dict[str, torch.Tensor],
+        adapter_name: str,
+        peft_model: Any,
+    ) -> dict[str, torch.Tensor]:
+        """Pad each checkpoint tensor into the live adapter's shape, copying into the
+        top-left slice and leaving the rest at the fresh-init values PEFT populated when
+        the adapter was (re-)created.
+
+        :param adapter_state: Raw state dict loaded from an
+            ``adapter_model.safetensors`` file.
+        :type adapter_state: dict[str, torch.Tensor]
+        :param adapter_name: Name of the live adapter whose shape should be matched.
+        :type adapter_name: str
+        :param peft_model: The underlying ``PeftModel``.
+        :type peft_model: peft.PeftModel
+        :return: A new state dict with every tensor reshaped to match the live adapter.
+        :rtype: dict[str, torch.Tensor]
+        """
+        live_state = get_peft_model_state_dict(peft_model, adapter_name=adapter_name)
+        padded: dict[str, torch.Tensor] = {}
+        for key, ckpt_t in adapter_state.items():
+            live_t = live_state.get(key)
+            if live_t is None or tuple(live_t.shape) == tuple(ckpt_t.shape):
+                padded[key] = ckpt_t
+                continue
+            if any(ck > lv for ck, lv in zip(ckpt_t.shape, live_t.shape, strict=False)):
+                # Checkpoint rank > live rank shouldn't happen with max() merge, but
+                # fall back to a straight load so PEFT raises a clear error.
+                padded[key] = ckpt_t
+                continue
+            canvas = live_t.detach().clone()
+            slices = tuple(slice(0, d) for d in ckpt_t.shape)
+            canvas[slices] = ckpt_t.to(canvas.dtype).to(canvas.device)
+            padded[key] = canvas
+        return padded
+
+    @staticmethod
+    def _create_prompt_masks(
+        prompt_lengths: list[int], max_length: int
+    ) -> torch.Tensor:
         """Create a mask for the prompts based on the prompt lengths (vectorized).
 
         :param prompt_lengths: List of prompt lengths
@@ -3109,70 +4731,86 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
                 stacklevel=2,
             )
             self.vllm_config = VLLMConfig()
-        if self.accelerator is not None:
-            if (
-                self.accelerator.num_processes % self.vllm_config.tensor_parallel_size
-                != 0
-            ):
-                msg = f"Tensor parallel size {self.vllm_config.tensor_parallel_size} must be a multiple of the number of processes {self.accelerator.num_processes}."
-                raise ValueError(
-                    msg,
-                )
+        num_processes = (
+            self.accelerator.num_processes if self.accelerator is not None else 1
+        )
+        process_index = (
+            self.accelerator.process_index if self.accelerator is not None else 0
+        )
+        local_process_index = (
+            self.accelerator.local_process_index if self.accelerator is not None else 0
+        )
+        if num_processes % self.vllm_config.tensor_parallel_size != 0:
+            msg = f"Tensor parallel size {self.vllm_config.tensor_parallel_size} must be a multiple of the number of processes {num_processes}."
+            raise ValueError(
+                msg,
+            )
 
-            if self.vllm_config.tensor_parallel_size > 1:
-                # Create subgroups of ranks for TP, each group with `vllm_tensor_parallel_size` ranks.
-                # For example, if world_size=8 and vllm_tensor_parallel_size=2 → groups: [0,1], [2,3], [4,5], [6,7]
-                self.tp_group, _ = torch.distributed.new_subgroups_by_enumeration(
-                    [
-                        list(
-                            range(
-                                i * self.vllm_config.tensor_parallel_size,
-                                (i + 1) * self.vllm_config.tensor_parallel_size,
-                            ),
-                        )
-                        for i in range(
-                            self.accelerator.num_processes
-                            // self.vllm_config.tensor_parallel_size,
-                        )
-                    ],
-                )
-
-            # vLLM requires the environment variables to be set for distributed training.
-            os.environ["RANK"] = str(self.accelerator.process_index)
-            os.environ["LOCAL_RANK"] = str(self.accelerator.local_process_index)
-            os.environ["WORLD_SIZE"] = str(self.accelerator.num_processes)
-            os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR", "localhost")
-            os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "12345")
-
-            llm_kwargs = {
-                "model": self.pretrained_model_name_or_path,
-                "tensor_parallel_size": self.vllm_config.tensor_parallel_size,
-                "gpu_memory_utilization": self.vllm_config.gpu_memory_utilization,
-                "max_num_seqs": self.vllm_config.max_num_seqs,
-                "max_model_len": self.max_model_len,
-                "distributed_executor_backend": "external_launcher",
-                "seed": self.accelerator.process_index
-                // self.vllm_config.tensor_parallel_size,
-                "max_num_batched_tokens": self.vllm_config.max_num_seqs
-                * self.max_model_len,
-                "model_impl": "vllm",
-                "enable_sleep_mode": self.vllm_config.sleep_mode,
-            }
-            try:
-                self.llm = LLM(**llm_kwargs)
-            except ValueError as err:
-                backend_env = os.environ.get("VLLM_ATTENTION_BACKEND")
-                if backend_env is not None and "backend" in str(err).lower():
-                    msg = (
-                        "vLLM initialization failed due to unsupported "
-                        f"VLLM_ATTENTION_BACKEND={backend_env!r}. "
-                        "Please unset VLLM_ATTENTION_BACKEND or set it to a backend "
-                        "supported by your installed vLLM build."
+        if self.vllm_config.tensor_parallel_size > 1:
+            # Create subgroups of ranks for TP, each group with `vllm_tensor_parallel_size` ranks.
+            # For example, if world_size=8 and vllm_tensor_parallel_size=2 → groups: [0,1], [2,3], [4,5], [6,7]
+            self.tp_group, _ = torch.distributed.new_subgroups_by_enumeration(
+                [
+                    list(
+                        range(
+                            i * self.vllm_config.tensor_parallel_size,
+                            (i + 1) * self.vllm_config.tensor_parallel_size,
+                        ),
                     )
-                    raise ValueError(msg) from err
-                raise
-            if self.vllm_config.sleep_mode:
-                self.llm.sleep(level=2)
+                    for i in range(
+                        num_processes // self.vllm_config.tensor_parallel_size,
+                    )
+                ],
+            )
+
+        # vLLM requires the environment variables to be set for distributed training.
+        os.environ["RANK"] = str(process_index)
+        os.environ["LOCAL_RANK"] = str(local_process_index)
+        os.environ["WORLD_SIZE"] = str(num_processes)
+        os.environ["MASTER_ADDR"] = os.environ.get("MASTER_ADDR", "localhost")
+        os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "12345")
+
+        llm_kwargs = {
+            "model": self.pretrained_model_name_or_path,
+            "tensor_parallel_size": self.vllm_config.tensor_parallel_size,
+            "gpu_memory_utilization": self.vllm_config.gpu_memory_utilization,
+            "max_num_seqs": self.vllm_config.max_num_seqs,
+            "max_model_len": self.max_model_len,
+            "distributed_executor_backend": "external_launcher",
+            "seed": process_index // self.vllm_config.tensor_parallel_size,
+            "max_num_batched_tokens": self.vllm_config.max_num_seqs
+            * self.max_model_len,
+            "model_impl": "vllm",
+            "enable_sleep_mode": self.vllm_config.sleep_mode,
+        }
+        if self.vllm_config.dtype is not None:
+            llm_kwargs["dtype"] = self.vllm_config.dtype
+        if self.vllm_config.quantization is not None:
+            llm_kwargs["quantization"] = self.vllm_config.quantization
+        if self.vllm_config.kv_cache_memory_bytes is not None:
+            # Forwards to vLLM's ``CacheConfig.kv_cache_memory_bytes``. When set,
+            # vLLM's ``determine_available_memory`` returns early and skips the
+            # memory-profiling assertion that otherwise fails when peer
+            # processes on the same GPU release memory mid-init. This is what
+            # lets the CI run multiple vLLM processes in parallel — see the
+            # ``VLLMConfig.kv_cache_memory_bytes`` docstring for details.
+            llm_kwargs["kv_cache_memory_bytes"] = self.vllm_config.kv_cache_memory_bytes
+        try:
+            self.llm = LLM(**llm_kwargs)
+        except ValueError as err:
+            backend_env = os.environ.get("VLLM_ATTENTION_BACKEND")
+            if backend_env is not None and "backend" in str(err).lower():
+                msg = (
+                    "vLLM initialization failed due to unsupported "
+                    f"VLLM_ATTENTION_BACKEND={backend_env!r}. "
+                    "Please unset VLLM_ATTENTION_BACKEND or set it to a backend "
+                    "supported by your installed vLLM build."
+                )
+                raise ValueError(msg) from err
+            raise
+
+        if self.vllm_config.sleep_mode:
+            self.llm.sleep(level=2)
 
         if self.accelerator is not None:
             self.accelerator.wait_for_everyone()
@@ -3181,20 +4819,19 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
         """Synchronize max_grad_norm with DeepSpeed gradient_clipping config.
         Registered as a mutation hook to ensure consistency after mutations.
         """
-        if self.accelerator is None:
+        if self.accelerator is None or self.accelerator.state.deepspeed_plugin is None:
             return
 
-        if (
-            "gradient_clipping"
-            not in self.accelerator.state.deepspeed_plugin.deepspeed_config
-        ):
+        ds_plugin = getattr(self.accelerator.state, "deepspeed_plugin", None)
+        if ds_plugin is None:
             return
 
-        ds_config = self.accelerator.state.deepspeed_plugin.deepspeed_config
+        ds_config = ds_plugin.deepspeed_config
+        if "gradient_clipping" not in ds_config:
+            return
+
         if ds_config["gradient_clipping"] != self.max_grad_norm:
-            self.accelerator.state.deepspeed_plugin.deepspeed_config[
-                "gradient_clipping"
-            ] = self.max_grad_norm
+            ds_config["gradient_clipping"] = self.max_grad_norm
 
         if hasattr(self.actor, "optimizer"):
             if hasattr(self.actor.optimizer, "grad_clip"):
@@ -3202,22 +4839,95 @@ class LLMAlgorithm(EvolvableAlgorithm, ABC):
             if hasattr(self.actor.optimizer, "clip_grad"):
                 self.actor.optimizer.clip_grad = self.max_grad_norm
 
-    def _get_lm_head(self):
-        """Locate the lm_head module, handling both raw and PEFT-wrapped models.
+    def _get_lm_head_parent(self) -> tuple[Any, str]:
+        """Locate the parent module owning ``lm_head`` (or ``embed_out``).
 
-        :return: The lm_head (or embed_out) linear layer.
-        :rtype: torch.nn.Module
+        Walks through value-head, PEFT, and LoRA wrappers to the inner
+        causal-LM that exposes the language-model head as an attribute.
+        Returned so that callers can both read the head (``getattr(parent,
+        attr)``) and replace it temporarily (``setattr(parent, attr, ...)``)
+        — the latter is used by the no-grad fused-linear-logprob path.
+
+        :return: ``(parent_module, attr_name)``.
         :raises AttributeError: If no lm_head can be found.
         """
         model = self.actor
+        if self.use_value_head and hasattr(model, "pretrained_model"):
+            # Value-head wrapper (e.g. AutoModelForCausalLMWithValueHead) →
+            # the PEFT/causal-LM inner model.
+            model = model.pretrained_model
         if hasattr(model, "base_model"):  # PeftModel → LoraModel
             model = model.base_model
         if hasattr(model, "model"):  # LoraModel → CausalLM
             model = model.model
         for attr in ("lm_head", "embed_out"):
             if hasattr(model, attr):
-                return getattr(model, attr)
-        err_msg = f"""Cannot find lm_head in {type(self.actor).__name__}.
-        Set use_liger_loss=False.
-        """
+                return model, attr
+        err_msg = (
+            f"Cannot find lm_head in {type(self.actor).__name__}. "
+            "Set use_liger_loss=False and use_fused_linear_logprobs=False."
+        )
         raise AttributeError(err_msg)
+
+    def _get_lm_head(self):
+        """Locate the lm_head module, handling value-head, PEFT and LoRA wrappers.
+
+        :return: The lm_head (or embed_out) linear layer.
+        :rtype: torch.nn.Module
+        :raises AttributeError: If no lm_head can be found.
+        """
+        parent, attr = self._get_lm_head_parent()
+        return getattr(parent, attr)
+
+    @contextmanager
+    def _patch_lm_head_to_identity(self):
+        """Temporarily replace ``lm_head`` with ``nn.Identity``.
+
+        With the head identity-patched, the model's ``output.logits`` becomes
+        the post-final-norm hidden state ``(B, T, H)`` instead of the full
+        ``(B, T, V)`` logits — which is what the no-grad fused-linear-logprob
+        kernel consumes directly. The original module is always restored,
+        even if the wrapped block raises.
+        """
+        model, attr = self._get_lm_head_parent()
+        original = getattr(model, attr)
+        setattr(model, attr, torch.nn.Identity())
+        try:
+            yield original
+        finally:
+            setattr(model, attr, original)
+
+    def _get_unwrapped_actor(self) -> Any:
+        """Return actor unwrapped from Accelerate and DummyEvolvable layers."""
+        actor = (
+            self.accelerator.unwrap_model(self.actor)
+            if self.accelerator is not None
+            else self.actor
+        )
+        while isinstance(actor, DummyEvolvable):
+            actor = actor.module
+        return actor
+
+    def _prepare_vllm_for_training(self) -> None:
+        """Prepare vLLM for learning."""
+        if self._vllm_awake and (
+            self.accelerator is None or self.accelerator.is_main_process
+        ):
+            torch.cuda.empty_cache()
+            self.llm.sleep(level=2)
+            self._vllm_awake = False
+
+        if self.use_vllm:
+            self._vllm_moved = False
+
+    def _prepare_vllm_for_generation(self) -> None:
+        if not self._vllm_awake and (
+            self.accelerator is None or self.accelerator.is_main_process
+        ):
+            torch.cuda.empty_cache()
+            self.llm.wake_up()
+            self._vllm_awake = True
+        if self.use_memory_efficient_params:
+            unwrapped_model = self._get_unwrapped_actor()
+            move_params_to_cpu(unwrapped_model)
+        self._move_model_to_vllm()

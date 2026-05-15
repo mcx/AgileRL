@@ -1,7 +1,6 @@
 [project]
 name = "agilerl"
-
-version = "2.6.1"
+version = "2.7.0"
 description = "AgileRL is a deep reinforcement learning library focused on improving RL development through RLOps."
 authors = [{ name = "Nick Ustaran-Anderegg", email = "dev@agilerl.com" }]
 license = "Apache-2.0"
@@ -40,6 +39,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+box2d = [
+    "swig~=4.4.1; sys_platform != 'win32'",
+    "gymnasium[box2d]~=1.0.0; sys_platform != 'win32'",
+]
 llm = [
     "datasets==4.4.1",
     "deepspeed~=0.17.1; sys_platform != 'win32'",
@@ -50,6 +53,8 @@ llm = [
     "vllm==0.11.0; sys_platform == 'darwin'",
 ]
 all = [
+    "swig~=4.4.1; sys_platform != 'win32'",
+    "gymnasium[box2d]~=1.0.0; sys_platform != 'win32'",
     "datasets==4.4.1",
     "deepspeed~=0.17.1; sys_platform != 'win32'",
     "liger-kernel==0.7.0; sys_platform == 'linux'",
@@ -64,6 +69,7 @@ dev = [
     "pytest~=9.0.2",
     "pytest-cov~=7.0.0",
     "pytest-env~=1.2.0",
+    "pytest-xdist~=3.5",
     "nvidia-ml-py>=12.0.0",  # For GPU memory monitoring in tests
 ]
 docs = [
@@ -75,7 +81,12 @@ docs = [
 ]
 
 [tool.pytest.ini_options]
-# Deterministic ordering for tests; useful for pytest-xdist.
+addopts = [
+    "-n", "auto",
+    "--dist", "loadgroup",
+    "--durations=0",
+    "--durations-min=1.0",
+]
 env = [
     "PYTHONHASHSEED=0",
     "VLLM_USE_FLASHINFER_SAMPLER=0",
@@ -93,15 +104,15 @@ filterwarnings = [
     "ignore::pyparsing.exceptions.PyparsingDeprecationWarning",
 ]
 markers = [
-    "llm: LLM-related tests (exclude with -m 'not llm')",
+    "vllm: tests that actually instantiate vllm.LLM (exclude with -m 'not vllm'). Pinned to a single xdist worker because vLLM's GPU memory profiling fails when peer workers free memory mid-init.",
+    "gpu: tests that use a GPU (CUDA, DeepSpeed, etc.) but do NOT initialise real vLLM (exclude with -m 'not gpu'). Safe to fan out across multiple xdist workers.",
 ]
 
 [tool.coverage.run]
 parallel = true
 source = ["agilerl"]
-concurrency = ["multiprocessing"]
+concurrency = ["multiprocessing", "thread"]
 sigterm = true
-omit = ["agilerl/networks/distributions_experimental.py"]
 
 [tool.coverage.report]
 exclude_lines = [
@@ -113,6 +124,20 @@ exclude_lines = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.uv]
+# box2d has a bug where it doesn't declare swig as a build dependency.
+# This workaround tells uv to build box2d-py using the project environment directly
+# (not an isolated one), where it can see system PATH and find swig, which is already installed as a dependency
+# (no-build-isolation packages are built after the others).
+#
+# DeepSpeed can be built with env vars to specify compiler flags
+# e.g. DS_BUILD_FUSED_ADAM=1 is essential on L4 GPU
+# to pre-build the fused Adam kernel and prevent timeout during tests.
+no-build-isolation-package = [
+    "box2d-py",
+    "deepspeed"
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["agilerl"]
 
@@ -122,6 +147,7 @@ exclude = ["tutorials"]
 [tool.ruff]
 target-version = "py310"
 line-length = 88
+extend-exclude = ["tests/assets/tiny_llm"]
 
 [tool.ruff.lint]
 select = ["ALL"]
